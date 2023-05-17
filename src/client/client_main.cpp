@@ -446,6 +446,7 @@ int send_chunks_datanodes_k(char **data, int chunk_size, char *dst_filename_stri
         }
         metadata_array[i].chunk_size = chunk_size;
         metadata_array[i].block_size = -1; // Convenient to check if chunk or block
+        metadata_array[i].cur_eck = -3; // Convenient to check if chunk or block
         metadata_array[i].data = data[i];
         memset(metadata_array[i].dst_filename_datanode, 0, sizeof(metadata_array[i].dst_filename_datanode));
         sprintf(metadata_array[i].dst_filename_datanode, "%s_%d", dst_filename_stripe, i + 1); // filename on datanode

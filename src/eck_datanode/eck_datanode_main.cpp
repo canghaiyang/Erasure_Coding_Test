@@ -15,8 +15,50 @@
 #include "jerasure.h"
 #include "reed_sol.h"
 #include "galois.h"
+/* FIFO mutex for encode */
+typedef struct
+{
+    pthread_mutex_t mutex; // Mutex lock
+    pthread_cond_t cond;   // Condition variable
+    int queueSize;         // Size of the queue
+} FifoMutex;
 
 char *buffer_chunk = nullptr;
+
+FifoMutex fifoMutex;
+
+void initFifoMutex(FifoMutex *fifoMutex)
+{
+    pthread_mutex_init(&fifoMutex->mutex, NULL); // Initialize the mutex
+    pthread_cond_init(&fifoMutex->cond, NULL);   // Initialize the condition variable
+    fifoMutex->queueSize = 0;                    // Initialize the queue size
+}
+
+void lockFifoMutex(FifoMutex *fifoMutex)
+{
+    pthread_mutex_lock(&fifoMutex->mutex); // Acquire the mutex lock
+    fifoMutex->queueSize++;                // Increment the queue size
+
+    // Wait until previous threads release the lock
+    while (fifoMutex->queueSize > 1)
+    {
+        pthread_cond_wait(&fifoMutex->cond, &fifoMutex->mutex);
+    }
+
+    pthread_mutex_unlock(&fifoMutex->mutex); // Release the mutex lock
+}
+
+void unlockFifoMutex(FifoMutex *fifoMutex)
+{
+    pthread_mutex_lock(&fifoMutex->mutex); // Acquire the mutex lock
+
+    fifoMutex->queueSize--; // Decrement the queue size
+
+    // Notify waiting threads
+    pthread_cond_broadcast(&fifoMutex->cond);
+
+    pthread_mutex_unlock(&fifoMutex->mutex); // Release the mutex lock
+}
 
 void *send_one_block_datanode(void *arg)
 {
@@ -217,7 +259,7 @@ void *handle_client_write(void *arg)
             free(buffer_chunk);
             return nullptr;
         }
-        
+
         /* create thread to handle file IO */
         pthread_t tid;
         metadata->data = buffer_chunk;
@@ -233,6 +275,37 @@ void *handle_client_write(void *arg)
     /* recv block data and send response */
     else
     {
+        printf("[handle_client_write] cur_block = %d\n", metadata->cur_block);
+
+        /* Send ecx metadata */
+        int tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, EC_K + metadata->cur_block % EC_X); /* Initialize thread metadata, enable ecx to recv blocks in FIFO */
+        if (tmp_return == EC_ERROR)
+        {
+            printf("[handle_client_write] Failed to initialize network\n");
+            return nullptr;
+        }
+        if (send(metadata->sockfd, metadata, sizeof(metadata_t), 0) < 0)
+        {
+            printf("[send_one_block_datanode] Failed to send block metadata to datanode\n");
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+        error_response = 0;
+        if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
+        {
+            printf("[send_one_block_datanode] Failed to recv block metadata response from datanode\n");
+            perror("recv"); // print error information
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+        if (error_response == 0)
+        {
+            printf("[send_one_block_datanode] Failed to recv block metadata response from datanode\n");
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+
+        /* recv client datda */
         char *buffer_block = nullptr;
         if (metadata->cur_block == 0)
         {
@@ -270,27 +343,52 @@ void *handle_client_write(void *arg)
             return nullptr;
         }
 
-        /* Initialize thread metadata */
-        int tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, EC_K + metadata->cur_block % EC_X);
-        if (tmp_return == EC_ERROR)
-        {
-            printf("[handle_client_write] Failed to initialize network\n");
-            return nullptr;
-        }
         metadata->data = buffer_block;
-        pthread_t tid_block;
-        if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
+        lockFifoMutex(&fifoMutex);
+
+        // if (send(metadata->sockfd, metadata, sizeof(metadata_t), 0) < 0)
+        // {
+        //     printf("[send_one_block_datanode] Failed to send block metadata to datanode\n");
+        //     metadata->error_flag = EC_ERROR;
+        //     return nullptr;
+        // }
+        // error_response = 0;
+        // if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
+        // {
+        //     printf("[send_one_block_datanode] Failed to recv block metadata response from datanode\n");
+        //     perror("recv"); // print error information
+        //     metadata->error_flag = EC_ERROR;
+        //     return nullptr;
+        // }
+        // if (error_response == 0)
+        // {
+        //     printf("[send_one_block_datanode] Failed to recv block metadata response from datanode\n");
+        //     metadata->error_flag = EC_ERROR;
+        //     return nullptr;
+        // }
+
+        /* Send ecx data */
+        if (send(metadata->sockfd, metadata->data, metadata->block_size, 0) < 0)
         {
-            printf("[handle_client_write] Failed to create send one block thread\n");
+            printf("[send_one_block_datanode] Failed to send block data to datanode\n");
+            metadata->error_flag = EC_ERROR;
             return nullptr;
         }
 
-        /* Wait until thread end */
-        if (pthread_join(tid_block, nullptr) != 0)
+        if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
         {
-            printf("[recv_data_chunks_datanodes] Failed to join thread\n");
+            printf("[send_one_block_datanode] Failed to recv block data response from datanode\n");
+            metadata->error_flag = EC_ERROR;
             return nullptr;
         }
+        if (error_response == 1)
+        {
+            printf("[send_one_block_datanode] Failed to recv block data response from datanode: recv error\n");
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+        close(metadata->sockfd);
+        unlockFifoMutex(&fifoMutex);
 
         /* If cur_block is last block ,create thread to handle file IO */
         if (metadata->cur_block == EC_N - 1)
@@ -330,6 +428,8 @@ void *client_write(void *arg)
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
     pthread_t tid;
+
+    initFifoMutex(&fifoMutex);
 
     /* wait for client connection */
     while (1)

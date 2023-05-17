@@ -16,14 +16,65 @@
 #include "reed_sol.h"
 #include "galois.h"
 
+/* FIFO mutex for encode */
+typedef struct
+{
+    pthread_mutex_t mutex; // Mutex lock
+    pthread_cond_t cond;   // Condition variable
+    int queueSize;         // Size of the queue
+} FifoMutex;
+
 char *buffer_chunk = nullptr;
 char *block_multiply_m = nullptr;
 int init[EC_M];
-int block_count = -1;
 char *buffer_next_ecx_block = nullptr;
 int *matrix = nullptr;
 
+int ych_test = 0;
+
+/* Global variable control */
+int block_count = -1;
 pthread_mutex_t mutex_block_count = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_buffer_next_ecx_block = PTHREAD_MUTEX_INITIALIZER;
+
+/* multiple threads control */
+int encode_count = 0;
+pthread_mutex_t mutex_encode = PTHREAD_MUTEX_INITIALIZER;
+FifoMutex fifoMutex_net;
+FifoMutex fifoMutex_enc;
+
+void initFifoMutex(FifoMutex *fifoMutex)
+{
+    pthread_mutex_init(&fifoMutex->mutex, NULL); // Initialize the mutex
+    pthread_cond_init(&fifoMutex->cond, NULL);   // Initialize the condition variable
+    fifoMutex->queueSize = 0;                    // Initialize the queue size
+}
+
+void lockFifoMutex(FifoMutex *fifoMutex)
+{
+    pthread_mutex_lock(&fifoMutex->mutex); // Acquire the mutex lock
+    fifoMutex->queueSize++;                // Increment the queue size
+
+    // Wait until previous threads release the lock
+    while (fifoMutex->queueSize > 1)
+    {
+        pthread_cond_wait(&fifoMutex->cond, &fifoMutex->mutex);
+    }
+
+    pthread_mutex_unlock(&fifoMutex->mutex); // Release the mutex lock
+}
+
+void unlockFifoMutex(FifoMutex *fifoMutex)
+{
+    pthread_mutex_lock(&fifoMutex->mutex); // Acquire the mutex lock
+
+    fifoMutex->queueSize--; // Decrement the queue size
+
+    // Notify waiting threads
+    pthread_cond_broadcast(&fifoMutex->cond);
+
+    pthread_mutex_unlock(&fifoMutex->mutex); // Release the mutex lock
+}
 
 int initialize_network(int *sockfd_p, int port, int ip_offset)
 {
@@ -93,9 +144,11 @@ void *send_one_request_datanode(void *arg)
         if (recv_size < 0)
         {
             printf("[send_one_request_datanode] Failed to recv chunc data\n");
+            perror("recv"); // print error information
             metadata->error_flag = EC_ERROR;
             return nullptr;
         }
+        printf("ych_test recv\n");
         tmp_block_size -= recv_size;
         tmp_buffer_block += recv_size;
     }
@@ -262,12 +315,31 @@ void *handle_client_write(void *arg)
     int tmp_return;
     metadata_t *metadata = (metadata_t *)malloc(sizeof(metadata_t));
     int error_response = 0;
-
+    printf("ych_test1\n");
+    lockFifoMutex(&fifoMutex_net);
+    printf("ych_test2\n");
     /* Recv metadata and send response */
     if (recv(client_fd, metadata, sizeof(metadata_t), 0) < 0)
     {
         printf("[handle_client_write] Failed to recv metadata\n");
         return nullptr;
+    }
+
+    /* Print current block info */
+    if (metadata->block_size != -1)
+    {
+        if (metadata->cur_eck == -1)
+        {
+            printf("[handle_client_write] cur_eck = %d  RECV ECX ENC BLOCK\n", metadata->cur_eck);
+        }
+        else if (metadata->cur_eck == -2)
+        {
+            printf("[handle_client_write] cur_eck = %d SEND ECX ENC BLOCK\n", metadata->cur_eck);
+        }
+        else
+        {
+            printf("[handle_client_write] cur_eck = %d RECV ECK BLOCK\n", metadata->cur_eck);
+        }
     }
 
     /* If recv chunk */
@@ -303,6 +375,7 @@ void *handle_client_write(void *arg)
             printf("[handle_client_write] Failed to send chunk data response to client\n");
             return nullptr;
         }
+        unlockFifoMutex(&fifoMutex_net);
 
         /* create thread to handle file IO */
         pthread_t tid;
@@ -323,7 +396,6 @@ void *handle_client_write(void *arg)
     /* If recv ecx block */
     else if (metadata->cur_eck == -1)
     {
-        printf("ych-recv ECX BLOCK\n");
         error_response = 1;
         if (send(client_fd, &error_response, sizeof(error_response), 0) < 0)
         {
@@ -368,6 +440,8 @@ void *handle_client_write(void *arg)
             printf("[handle_client_write] Failed to send block data response to ecx datanode\n");
             return nullptr;
         }
+        unlockFifoMutex(&fifoMutex_net);
+
         pthread_mutex_lock(&mutex_block_count);
         block_count++;
         pthread_mutex_unlock(&mutex_block_count);
@@ -441,7 +515,6 @@ void *handle_client_write(void *arg)
     /* If recv ecx block request */
     else if (metadata->cur_eck == -2)
     {
-        printf("ych-recv BLOCK REQUEST\n");
         int tmp_block_size;
         if (metadata->cur_block - 1 == 0)
         {
@@ -456,12 +529,14 @@ void *handle_client_write(void *arg)
             printf("[handle_client_write] Failed to send metadata response to ecx datanode\n");
             return nullptr;
         }
+        unlockFifoMutex(&fifoMutex_net);
         free(buffer_next_ecx_block);
+        pthread_mutex_unlock(&mutex_buffer_next_ecx_block);
     }
     /* If recv eck block */
     else
     {
-        printf("ych-ECK BLOCK\n");
+        printf("[ych_test] cur_eck = %d\n", metadata->cur_eck);
         error_response = 1;
         if (send(client_fd, &error_response, sizeof(error_response), 0) < 0)
         {
@@ -491,7 +566,11 @@ void *handle_client_write(void *arg)
             printf("[handle_client_write] Failed to send block data response to eck datanode\n");
             return nullptr;
         }
+        unlockFifoMutex(&fifoMutex_net);
 
+        lockFifoMutex(&fifoMutex_enc);
+        // pthread_mutex_lock(&mutex_encode);
+        printf("[ych_test] lock cur_eck = %d \n", metadata->cur_eck);
         /* For encode and save */
         if (metadata->cur_eck == 0) // If eck block from the first eck datanode
         {
@@ -504,16 +583,10 @@ void *handle_client_write(void *arg)
 
         char **coding_block = (char **)malloc(sizeof(char *) * EC_M); // Convenient to save intermediate coding block
 
-        struct timeval t_enc1, t_enc2;
-        struct timezone tz;
-        double tsec;
-        if (metadata->cur_block == EC_N - 1 && metadata->cur_eck == EC_K - 1)
-        {
-            gettimeofday(&t_enc1, &tz);
-        }
-
         /* Encoded */
         int matrix_value[EC_M];
+        printf("[ych_test] block_multiply_m will be used ych_test = %d, cur_eck = %d \n", ych_test, metadata->cur_eck);
+        ych_test = 1;
         for (i = 0; i < EC_M; i++)
         {
             matrix_value[i] = *(matrix + (i * EC_K) + metadata->cur_eck);
@@ -553,21 +626,26 @@ void *handle_client_write(void *arg)
         }
         free(buffer_block);
         free(coding_block);
-
-        if (metadata->cur_block == EC_N - 1 && metadata->cur_eck == EC_K - 1)
-        {
-            gettimeofday(&t_enc2, &tz);
-            tsec = 0.0;
-            tsec += t_enc2.tv_usec;
-            tsec -= t_enc1.tv_usec;
-            tsec /= 1000000.0;
-            tsec += t_enc2.tv_sec;
-            tsec -= t_enc1.tv_sec;
-            printf("[handle_client_write] encoding time = %0.10f\n", tsec);
-        }
+        ych_test = 0;
+        printf("[ych_test] block_multiply_m finished ych_test = %d, cur_eck = %d \n", ych_test, metadata->cur_eck);
+        encode_count++;
+        // pthread_mutex_unlock(&mutex_encode);
+        unlockFifoMutex(&fifoMutex_enc);
         /* If is last cur eck block */
-        if (metadata->cur_eck == EC_K - 1)
+        // if (metadata->cur_eck == EC_K - 1)
+        if (encode_count == EC_K)
         {
+            printf("[ych_test] cur_eck = %d\n", metadata->cur_eck);
+            encode_count = 0;
+
+            if (block_count == -1) // And the first round block
+            {
+                pthread_mutex_lock(&mutex_block_count);
+                block_count = 0;
+                pthread_mutex_unlock(&mutex_block_count);
+                buffer_chunk = (char *)malloc(sizeof(char) * metadata->chunk_size); // Save block or chunk
+            }
+
             /* Avoid being used by other threads before the coding blocks are transmitted completely */
             char *tmp_block_multiply_m = (char *)malloc(sizeof(char) * metadata->block_size * EC_M);
             memcpy(tmp_block_multiply_m, block_multiply_m, metadata->block_size * EC_M);
@@ -584,6 +662,7 @@ void *handle_client_write(void *arg)
             /* saved for next ecx datanode */
             if (metadata->cur_block != EC_N - 1)
             {
+                pthread_mutex_lock(&mutex_buffer_next_ecx_block);
                 buffer_next_ecx_block = (char *)malloc(sizeof(char) * metadata->block_size);
                 memcpy(buffer_next_ecx_block, tmp_block_multiply_m + next_ecx_datanode * metadata->block_size, metadata->block_size);
             }
@@ -604,32 +683,27 @@ void *handle_client_write(void *arg)
             /* Send coding blocks request to previous ecx datanode */
             pthread_t tid_request;
             metadata_t *tmp_metadata;
-            if (metadata->cur_eck == EC_K - 1)
+            if (metadata->cur_block != 0 && local_ecx_datanode < EC_M) // Not the first block and is coding datanode
             {
-                int next_next_ecx_datanode = (metadata->cur_block + 2) % EC_X;
-                int next_ecx_datanode = (metadata->cur_block + 1) % EC_X;
-                int local_ecx_datanode = metadata->cur_block % EC_X;
-                int prev_ecx_datanode = (metadata->cur_block - 1 + EC_X) % EC_X;
-                if (metadata->cur_block != 0 && local_ecx_datanode < EC_M) // Not the first block and is coding datanode
+                tmp_metadata = (metadata_t *)malloc(sizeof(metadata_t));
+                memcpy(tmp_metadata, metadata, sizeof(metadata_t));
+                /* Initialize thread metadata */
+                int tmp_return = initialize_network(&tmp_metadata->sockfd, EC_WRITE_REQUEST_PORT, EC_K + prev_ecx_datanode);
+                if (tmp_return == EC_ERROR)
                 {
-                    tmp_metadata = (metadata_t *)malloc(sizeof(metadata_t));
-                    memcpy(tmp_metadata, metadata, sizeof(metadata_t));
-                    /* Initialize thread metadata */
-                    int tmp_return = initialize_network(&tmp_metadata->sockfd, EC_WRITE_REQUEST_PORT, EC_K + prev_ecx_datanode);
-                    if (tmp_return == EC_ERROR)
-                    {
-                        printf("[send_one_request_datanode] Failed to initialize network\n");
-                        return nullptr;
-                    }
-                    tmp_metadata->cur_eck = -2; // ecx block request
-                    if (pthread_create(&tid_request, NULL, send_one_request_datanode, (void *)tmp_metadata) != 0)
-                    {
-                        printf("[handle_client_write] Failed to create send one block thread\n");
-                        return nullptr;
-                    }
+                    printf("[send_one_request_datanode] Failed to initialize network\n");
+                    return nullptr;
+                }
+                tmp_metadata->cur_eck = -2; // ecx block request
+                if (pthread_create(&tid_request, NULL, send_one_request_datanode, (void *)tmp_metadata) != 0)
+                {
+                    printf("[handle_client_write] Failed to create send one block thread\n");
+                    return nullptr;
                 }
             }
+
 #endif
+
 #endif
 
             /* Send coding blocks to ecm datanode, not send to coding datanode that also is next ecx datanode */
@@ -801,17 +875,9 @@ void *handle_client_write(void *arg)
                 free(tmp_metadata);
             }
 #endif
-
             /* Save coding block */
             if (local_ecx_datanode < EC_M)
             {
-                if (block_count == -1) // And the first round block
-                {
-                    pthread_mutex_lock(&mutex_block_count);
-                    block_count = 0;
-                    pthread_mutex_unlock(&mutex_block_count);
-                    buffer_chunk = (char *)malloc(sizeof(char) * metadata->chunk_size); // Save block or chunk
-                }
                 if (metadata->cur_block == 0)
                 {
                     tmp_block = buffer_chunk;
@@ -948,6 +1014,10 @@ void *client_write(void *arg)
 
     /* Create coding matrix */
     matrix = reed_sol_vandermonde_coding_matrix(EC_K, EC_M, EC_W);
+
+    /* FIFO mutex initialize */
+    initFifoMutex(&fifoMutex_net);
+    initFifoMutex(&fifoMutex_enc);
 
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
