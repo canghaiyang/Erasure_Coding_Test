@@ -446,7 +446,7 @@ int send_chunks_datanodes_k(char **data, int chunk_size, char *dst_filename_stri
         }
         metadata_array[i].chunk_size = chunk_size;
         metadata_array[i].block_size = -1; // Convenient to check if chunk or block
-        metadata_array[i].cur_eck = -3; // Convenient to check if chunk or block
+        metadata_array[i].cur_eck = -3;    // Convenient to check if chunk or block
         metadata_array[i].data = data[i];
         memset(metadata_array[i].dst_filename_datanode, 0, sizeof(metadata_array[i].dst_filename_datanode));
         sprintf(metadata_array[i].dst_filename_datanode, "%s_%d", dst_filename_stripe, i + 1); // filename on datanode
@@ -1105,12 +1105,14 @@ static int erasure_coding_write_eck(int argc, char **argv)
             {
                 min_tsec = tsec;
             }
-            printf("[erasure_coding_write_eck]  Current test times = %d : network time + encoding time = %0.10f\n", test_times, tsec);
+            printf("[erasure_coding_write_eck] Current test times = %d : EC write time (enc+net+disk) = %0.10f\n", test_times, tsec);
         }
         current_reading++;
     }
-    printf("[erasure_coding_write_eck] Average network time + encoding time = %0.10f\n", totalsec / reading / test_n);
-    printf("[erasure_coding_write_eck] Min network time + encoding time = %0.10f\n", min_tsec);
+#if (TEST_LOG)
+    printf("[erasure_coding_write_eck] Average EC write time (enc+net+disk) = %0.10f\n", totalsec / reading / test_n);
+#endif
+    printf("[erasure_coding_write_eck] Min EC write time (enc+net+disk) = %0.10f\n", min_tsec);
 
     fclose(src_fp);
     shutdown(client_fd, SHUT_RDWR);
@@ -1389,7 +1391,7 @@ static int erasure_coding_write(int argc, char **argv)
                 }
                 printf("[erasure_coding_write] The %dth chunk: write IO time = %0.10f\n", i + 1, tsec);
             }
-            printf("[erasure_coding_write] Max write IO time = %0.10f\n", max_tsec);
+            printf("[erasure_coding_write] Max write disk IO time = %0.10f\n", max_tsec);
             if (max_tsec > max_io)
             {
                 max_io = max_tsec;
@@ -1422,17 +1424,18 @@ static int erasure_coding_write(int argc, char **argv)
     fclose(file_size_fp);
     totalsec_net = totalsec_net_k + totalsec_net_m;
     min_net = min_net_k + min_net_m;
+#if (TEST_LOG)
     printf("[erasure_coding_write] Average network time k chunks = %0.10f\n", totalsec_net_k / reading / test_n);
     printf("[erasure_coding_write] Average network time m chunks = %0.10f\n", totalsec_net_m / reading / test_n);
     printf("[erasure_coding_write] Average network time k+m chunks= %0.10f\n", totalsec_net / reading / test_n);
     printf("[erasure_coding_write] Average encoding time = %0.10f\n", totalsec_enc / reading / test_n);
-    printf("[erasure_coding_write] Max write IO time = %0.10f\n", max_io);
-
+    printf("[erasure_coding_write] Max write disk IO time = %0.10f\n", max_io);
+#endif
     printf("[erasure_coding_write] Min network time k chunks = %0.10f\n", min_net_k);
     printf("[erasure_coding_write] Min network time m chunks = %0.10f\n", min_net_m);
     printf("[erasure_coding_write] Min network time k+m chunks= %0.10f\n", min_net);
     printf("[erasure_coding_write] Min encoding time = %0.10f\n", min_enc);
-    printf("[erasure_coding_write] Min write IO time = %0.10f\n", min_io);
+    printf("[erasure_coding_write] Min write disk IO time = %0.10f\n", min_io);
 
     fclose(src_fp);
 
