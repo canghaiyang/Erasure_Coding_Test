@@ -19,13 +19,14 @@
 #define TEST_WRITE_IO_PATH "test_file/test_write_IO/"   // file_size file saved path
 #define MAX_PATH_LEN 256                                // Max length of file path
 
-#define IP_PREFIX "192.168.7."      // datanode ip prefix
-#define DATANODE_START_IP_ADDR 102  // end_ip=start_ip+k+m, ip_addr_start (1-255,default ip_addr_end=ip_addr_start+k+m)
-#define EC_WRITE_PORT 8000          // network port for EC write 
-#define EC_READ_PORT 8001           // network port for EC read
-#define EC_WRITE_ECK_BASE_PORT 8010 // network port for ECK write ECX
-#define EC_WRITE_ECX_BASE_PORT 8050 // network port for ECX write ECX
-#define EC_WRITE_REQUEST_BASE_PORT 8090  // network port for EC write request 
+#define IP_PREFIX "192.168.7."          // datanode ip prefix
+#define DATANODE_START_IP_ADDR 102      // end_ip=start_ip+k+m, ip_addr_start (1-255,default ip_addr_end=ip_addr_start+k+m)
+#define EC_WRITE_PORT 8000              // network port for EC write
+#define EC_READ_PORT 8001               // network port for EC read
+#define EC_WRITE_NEW_PORT 8002          // network port for EC write new
+#define EC_WRITE_ECK_BASE_PORT 8010     // network port for ECK write ECX
+#define EC_WRITE_ECX_BASE_PORT 8050     // network port for ECX write ECX
+#define EC_WRITE_REQUEST_BASE_PORT 8090 // network port for EC write request
 
 #define EC_ERROR -1
 #define EC_OK 0

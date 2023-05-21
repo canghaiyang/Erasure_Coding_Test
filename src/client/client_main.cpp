@@ -21,6 +21,8 @@ int erasures[EC_K + EC_M];
 double time_enc = 0.0;
 double time_net_k = 0.0;
 double time_net_m = 0.0;
+double time_new_min = 0.0;
+double time_new = 0.0;
 
 /*
  * read k+m chunks from file to chunks, if file not enough, padding
@@ -187,30 +189,50 @@ void *send_one_block_datanode(void *arg)
         metadata->error_flag = EC_ERROR;
         return nullptr;
     }
-    close(metadata->sockfd);
     return nullptr;
 }
 
 int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int remain_block_size, char *dst_filename_stripe, int client_fd)
 {
     metadata_t metadata_array[EC_K * EC_N];
+    int sockfd_array[EC_K];
     pthread_t tid[EC_K * EC_N];
     int error_flag = EC_OK;
     int cur;
+    int i, j;
 
-    /* Send to each datanode */
-    for (int j = 0; j < EC_N; j++)
+    int tmp_return;
+    for (i = 0; i < EC_K; i++)
     {
-        for (int i = 0; i < EC_K; i++)
+        tmp_return = initialize_network(&sockfd_array[i], EC_WRITE_NEW_PORT, i);
+        if (tmp_return == EC_ERROR)
         {
+            printf("[send_blocks_eck_datanodes] Failed to initialize network\n");
+            return EC_ERROR;
+        }
+    }
+
+    /* Timing variables */
+    struct timeval t_new1, t_new2;
+
+    struct timezone tz;
+    gettimeofday(&t_new1, &tz);
+#if (TEST_LOG)
+    struct timeval t_new1_net_1, t_new2_net_1;     // ych_test
+    struct timeval t_new1_net_all, t_new2_net_all; // ych_test
+    gettimeofday(&t_new1_net_all, &tz);            // ych_test
+#endif
+    /* Send to each datanode */
+    for (j = 0; j < EC_N; j++)
+    {
+        for (i = 0; i < EC_K; i++)
+        {
+#if (TEST_LOG)
+            gettimeofday(&t_new1_net_1, &tz); // ych_test
+#endif
             cur = i * EC_N + j;
             /* Initialize thread metadata */
-            int tmp_return = initialize_network(&metadata_array[cur].sockfd, EC_WRITE_PORT, i);
-            if (tmp_return == EC_ERROR)
-            {
-                printf("[send_blocks_eck_datanodes] Failed to initialize network\n");
-                return EC_ERROR;
-            }
+            metadata_array[cur].sockfd = sockfd_array[i];
             metadata_array[cur].chunk_size = chunk_size;
             if (j == 0)
             {
@@ -242,13 +264,25 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
                 printf("[send_blocks_eck_datanodes] Failed to join thread\n");
                 return EC_ERROR;
             }
+#if (TEST_LOG)
+            gettimeofday(&t_new2_net_1, &tz);
+            time_new = 0.0;
+            time_new += t_new2_net_1.tv_usec;
+            time_new -= t_new1_net_1.tv_usec;
+            time_new /= 1000000.0;
+            time_new += t_new2_net_1.tv_sec;
+            time_new -= t_new1_net_1.tv_sec;
+            printf("ych_test 1 round time = %0.10f\n", time_new);
+#endif
+
 #endif
         }
     }
+
 #if (!SEND_METHOD)
-    for (int j = 0; j < EC_N; j++)
+    for (j = 0; j < EC_N; j++)
     {
-        for (int i = 0; i < EC_K; i++)
+        for (i = 0; i < EC_K; i++)
         {
             /* Wait until thread end */
             cur = i * EC_N + j;
@@ -260,10 +294,21 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
         }
     }
 #endif
+
+#if (TEST_LOG)
+    gettimeofday(&t_new2_net_all, &tz); // ych_test
+    time_new = 0.0;
+    time_new += t_new2_net_all.tv_usec;
+    time_new -= t_new1_net_all.tv_usec;
+    time_new /= 1000000.0;
+    time_new += t_new2_net_all.tv_sec;
+    time_new -= t_new1_net_all.tv_sec;
+    printf("ych_test 1 round time = %0.10f\n", time_new);
+#endif
     /* check if error */
-    for (int j = 0; j < EC_N; j++)
+    for (j = 0; j < EC_N; j++)
     {
-        for (int i = 0; i < EC_K; i++)
+        for (i = 0; i < EC_K; i++)
         {
             cur = i * EC_N + j;
             error_flag += metadata_array[cur].error_flag;
@@ -304,6 +349,24 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
         }
         chunk_count--;
     }
+
+    gettimeofday(&t_new2, &tz);
+    time_new = 0.0;
+    time_new += t_new2.tv_usec;
+    time_new -= t_new1.tv_usec;
+    time_new /= 1000000.0;
+    time_new += t_new2.tv_sec;
+    time_new -= t_new1.tv_sec;
+    if (time_new < time_new_min)
+    {
+        time_new_min = time_new;
+    }
+
+    for (i = 0; i < EC_K; i++)
+    {
+        close(sockfd_array[i]);
+    }
+
     return EC_OK;
 }
 
@@ -433,17 +496,29 @@ int send_chunks_datanodes_k(char **data, int chunk_size, char *dst_filename_stri
     metadata_t metadata_array[EC_K];
     pthread_t tid[EC_K];
     int error_flag = EC_OK;
+    int i;
+    int tmp_return;
 
-    /* Send to each datanode */
-    for (int i = 0; i < EC_K; i++)
+    for (i = 0; i < EC_K; i++)
     {
-        /* Initialize thread metadata */
-        int tmp_return = initialize_network(&metadata_array[i].sockfd, EC_WRITE_PORT, i);
+        tmp_return = initialize_network(&metadata_array[i].sockfd, EC_WRITE_PORT, i);
         if (tmp_return == EC_ERROR)
         {
             printf("[send_chunks_datanodes_k] Failed to initialize network\n");
             return EC_ERROR;
         }
+    }
+
+    /* Timing variables */
+    struct timeval t_net1, t_net2;
+    struct timezone tz;
+    double tsec;
+    gettimeofday(&t_net1, &tz);
+
+    /* Send to each datanode */
+    for (i = 0; i < EC_K; i++)
+    {
+        /* Initialize thread metadata */
         metadata_array[i].chunk_size = chunk_size;
         metadata_array[i].block_size = -1; // Convenient to check if chunk or block
         metadata_array[i].cur_eck = -3;    // Convenient to check if chunk or block
@@ -466,7 +541,7 @@ int send_chunks_datanodes_k(char **data, int chunk_size, char *dst_filename_stri
             printf("[send_chunks_datanodes_k] Failed to join thread\n");
             return EC_ERROR;
         }
-        close(metadata_array[i].sockfd);
+
 #endif
     }
 #if (!SEND_METHOD)
@@ -478,9 +553,18 @@ int send_chunks_datanodes_k(char **data, int chunk_size, char *dst_filename_stri
             printf("[send_chunks_datanodes] Failed to join thread\n");
             return EC_ERROR;
         }
-        close(metadata_array[i].sockfd);
     }
 #endif
+
+    gettimeofday(&t_net2, &tz);
+    tsec = 0.0;
+    tsec += t_net2.tv_usec;
+    tsec -= t_net1.tv_usec;
+    tsec /= 1000000.0;
+    tsec += t_net2.tv_sec;
+    tsec -= t_net1.tv_sec;
+    time_net_k = tsec; // Easy to sum net_k time
+
     /* check if error */
     for (int i = 0; i < EC_K; i++)
     {
@@ -490,6 +574,11 @@ int send_chunks_datanodes_k(char **data, int chunk_size, char *dst_filename_stri
     {
         return EC_ERROR;
     }
+    for (i = 0; i < EC_K; i++)
+    {
+        close(metadata_array[i].sockfd);
+    }
+
     return EC_OK;
 }
 
@@ -498,17 +587,28 @@ int send_chunks_datanodes_m(char **coding, int chunk_size, char *dst_filename_st
     metadata_t metadata_array[EC_K + EC_M];
     pthread_t tid[EC_K + EC_M];
     int error_flag = EC_OK;
+    int i;
+    int tmp_return;
 
-    /* Send to each datanode */
-    for (int i = EC_K; i < EC_K + EC_M; i++)
+    for (i = EC_K; i < EC_K + EC_M; i++)
     {
-        /* Initialize thread metadata */
-        int tmp_return = initialize_network(&metadata_array[i].sockfd, EC_WRITE_PORT, i);
+        tmp_return = initialize_network(&metadata_array[i].sockfd, EC_WRITE_PORT, i);
         if (tmp_return == EC_ERROR)
         {
             printf("[send_chunks_datanodes_m] Failed to initialize network\n");
             return EC_ERROR;
         }
+    }
+
+    /* Timing variables */
+    struct timeval t_net1, t_net2;
+    struct timezone tz;
+    double tsec;
+    gettimeofday(&t_net1, &tz);
+
+    /* Send to each datanode */
+    for (i = EC_K; i < EC_K + EC_M; i++)
+    {
         metadata_array[i].chunk_size = chunk_size;
         metadata_array[i].block_size = -1; // Convenient to check if chunk or block
         metadata_array[i].data = coding[i - EC_K];
@@ -530,12 +630,11 @@ int send_chunks_datanodes_m(char **coding, int chunk_size, char *dst_filename_st
             printf("[send_chunks_datanodes_m] Failed to join thread\n");
             return EC_ERROR;
         }
-        close(metadata_array[i].sockfd);
 
 #endif
     }
 #if (!SEND_METHOD)
-    for (int i = 0; i < EC_K + EC_M; i++)
+    for (i = 0; i < EC_K + EC_M; i++)
     {
         /* Wait until thread end */
         if (pthread_join(tid[i], nullptr) != 0)
@@ -543,11 +642,20 @@ int send_chunks_datanodes_m(char **coding, int chunk_size, char *dst_filename_st
             printf("[send_chunks_datanodes] Failed to join thread\n");
             return EC_ERROR;
         }
-        close(metadata_array[i].sockfd);
     }
 #endif
+
+    gettimeofday(&t_net2, &tz);
+    tsec = 0.0;
+    tsec += t_net2.tv_usec;
+    tsec -= t_net1.tv_usec;
+    tsec /= 1000000.0;
+    tsec += t_net2.tv_sec;
+    tsec -= t_net1.tv_sec;
+    time_net_m = tsec; // Easy to sum net_k time
+
     /* check if error */
-    for (int i = EC_K; i < EC_K + EC_M; i++)
+    for (i = EC_K; i < EC_K + EC_M; i++)
     {
         error_flag += metadata_array[i].error_flag;
     }
@@ -555,6 +663,11 @@ int send_chunks_datanodes_m(char **coding, int chunk_size, char *dst_filename_st
     {
         return EC_ERROR;
     }
+    for (i = EC_K; i < EC_K + EC_M; i++)
+    {
+        close(metadata_array[i].sockfd);
+    }
+
     return EC_OK;
 }
 
@@ -767,9 +880,8 @@ void *encode_thread(void *arg)
     tsec /= 1000000.0;
     tsec += t_enc2.tv_sec;
     tsec -= t_enc1.tv_sec;
-    printf("[encode_thread] Encoding time = %0.10f\n", tsec);
-
     time_enc = tsec; // Easy to sum enc time
+
     return nullptr;
 }
 
@@ -851,8 +963,6 @@ void *encode_mul_thread(void *arg)
     tsec /= 1000000.0;
     tsec += t_enc2.tv_sec;
     tsec -= t_enc1.tv_sec;
-    printf("[encode_thread] Mul thread encoding time = %0.10f\n", tsec);
-
     time_enc = tsec; // Easy to sum enc time
 
     for (thread_num = 0; thread_num < ENC_THREAD_NUM; thread_num++)
@@ -870,14 +980,7 @@ void *encode_mul_thread(void *arg)
 void *network_k_thread(void *arg)
 {
     network_t *network_metadata = (network_t *)arg;
-
-    /* Timing variables */
-    struct timeval t_net1, t_net2;
-    struct timezone tz;
-    double tsec;
     int tmp_return;
-
-    gettimeofday(&t_net1, &tz);
 
     /* send chunks to each datanode */
     tmp_return = send_chunks_datanodes_k(network_metadata->data, network_metadata->chunk_size, network_metadata->dst_filename_stripe);
@@ -887,30 +990,13 @@ void *network_k_thread(void *arg)
         return nullptr;
     }
 
-    gettimeofday(&t_net2, &tz);
-    tsec = 0.0;
-    tsec += t_net2.tv_usec;
-    tsec -= t_net1.tv_usec;
-    tsec /= 1000000.0;
-    tsec += t_net2.tv_sec;
-    tsec -= t_net1.tv_sec;
-    printf("[network_k_thread] Network k chunks time = %0.10f\n", tsec);
-
-    time_net_k = tsec; // Easy to sum net_k time
     return nullptr;
 }
 
 void *network_m_thread(void *arg)
 {
     network_t *network_metadata = (network_t *)arg;
-
-    /* Timing variables */
-    struct timeval t_net1, t_net2;
-    struct timezone tz;
-    double tsec;
     int tmp_return;
-
-    gettimeofday(&t_net1, &tz);
 
     /* send chunks to each datanode */
     tmp_return = send_chunks_datanodes_m(network_metadata->coding, network_metadata->chunk_size, network_metadata->dst_filename_stripe);
@@ -919,17 +1005,6 @@ void *network_m_thread(void *arg)
         printf("[network_k_thread] Failed to send m chunks to datanode");
         return nullptr;
     }
-
-    gettimeofday(&t_net2, &tz);
-    tsec = 0.0;
-    tsec += t_net2.tv_usec;
-    tsec -= t_net1.tv_usec;
-    tsec /= 1000000.0;
-    tsec += t_net2.tv_sec;
-    tsec -= t_net1.tv_sec;
-    printf("[network_k_thread] Network m chunks time = %0.10f\n", tsec);
-
-    time_net_m = tsec; // Easy to sum net_k time
     return nullptr;
 }
 
@@ -1014,11 +1089,7 @@ static int erasure_coding_write_eck(int argc, char **argv)
     }
 
     /* Timing variables */
-    struct timeval t_io1, t_io2, t_enc1, t_enc2, t_net1, t_net2;
-    struct timezone tz;
-    double tsec;
     double totalsec = 0.0;
-    double min_tsec = 99999.99999;
 
     /* Open src_filename and error check */
     src_fp = fopen(src_filename, "rb");
@@ -1078,11 +1149,9 @@ static int erasure_coding_write_eck(int argc, char **argv)
 
         /* Begin Test */
         int test_times;
+        time_new_min = 99999.99999;
         for (test_times = 1; test_times <= test_n; test_times++)
         {
-
-            gettimeofday(&t_net1, &tz);
-
             /* Send blocks to each datanode */
             tmp_return = send_blocks_eck_datanodes(block, chunk_size, block_size, remain_block_size, dst_filename_stripe, client_fd);
             if (tmp_return == EC_ERROR)
@@ -1091,29 +1160,15 @@ static int erasure_coding_write_eck(int argc, char **argv)
                 fclose(src_fp);
                 return EC_ERROR;
             }
-
-            gettimeofday(&t_net2, &tz);
-            tsec = 0.0;
-            tsec += t_net2.tv_usec;
-            tsec -= t_net1.tv_usec;
-            tsec /= 1000000.0;
-            tsec += t_net2.tv_sec;
-            tsec -= t_net1.tv_sec;
-            totalsec += tsec;
-
-            if (tsec < min_tsec)
-            {
-                min_tsec = tsec;
-            }
-            printf("[erasure_coding_write_eck] Current test times = %d : EC write time (enc+net+disk) = %0.10f\n", test_times, tsec);
+            totalsec += time_new;
+            printf("[erasure_coding_write_eck] Current test times = %d : EC write time (enc+net+disk) = %0.10f\n", test_times, time_new);
         }
         current_reading++;
     }
 #if (TEST_LOG)
     printf("[erasure_coding_write_eck] Average EC write time (enc+net+disk) = %0.10f\n", totalsec / reading / test_n);
 #endif
-    printf("[erasure_coding_write_eck] Min EC write time (enc+net+disk) = %0.10f\n", min_tsec);
-
+    printf("[erasure_coding_write_eck] Min EC write time (enc+net+disk) = %0.10f\n", time_new_min);
     fclose(src_fp);
     shutdown(client_fd, SHUT_RDWR);
     close(client_fd);
@@ -1318,6 +1373,7 @@ static int erasure_coding_write(int argc, char **argv)
             {
                 min_enc = time_enc;
             }
+            printf("[encode_thread] Encoding time = %0.10f\n", time_enc);
 
 #if (SEND_DATANODE)
             if (pthread_join(tid_network_k, nullptr) != 0) /* Wait until network_k_thread thread end */
@@ -1330,6 +1386,7 @@ static int erasure_coding_write(int argc, char **argv)
             {
                 min_net_k = time_net_k;
             }
+            printf("[network_k_thread] Network k chunks time = %0.10f\n", time_net_k);
 
             /* Send m chunk */
             pthread_t tid_network_m;
@@ -1348,6 +1405,7 @@ static int erasure_coding_write(int argc, char **argv)
             {
                 min_net_m = time_net_m;
             }
+            printf("[network_k_thread] Network m chunks time = %0.10f\n", time_net_m);
 #endif
             /* IO write chunk test */
             char test_write_io_filename[MAX_PATH_LEN] = {0};
@@ -1391,7 +1449,9 @@ static int erasure_coding_write(int argc, char **argv)
                 }
                 printf("[erasure_coding_write] The %dth chunk: write IO time = %0.10f\n", i + 1, tsec);
             }
+#if (TEST_LOG)
             printf("[erasure_coding_write] Max write disk IO time = %0.10f\n", max_tsec);
+#endif
             if (max_tsec > max_io)
             {
                 max_io = max_tsec;
