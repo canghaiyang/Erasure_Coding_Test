@@ -437,7 +437,6 @@ void galois_w08_region_multiply(char *region,      /* Region to multiply */
     }
   }
  */
-
   if (galois_mult_tables[8] == NULL) {
     if (galois_create_mult_tables(8) < 0) {
       fprintf(stderr, "galois_08_region_multiply -- couldn't make multiplication tables\n");

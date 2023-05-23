@@ -218,9 +218,9 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
     struct timezone tz;
     gettimeofday(&t_new1, &tz);
 #if (TEST_LOG)
-    struct timeval t_new1_net_1, t_new2_net_1;     // ych_test
-    struct timeval t_new1_net_all, t_new2_net_all; // ych_test
-    gettimeofday(&t_new1_net_all, &tz);            // ych_test
+    struct timeval t_new1_net_1, t_new2_net_1;     
+    struct timeval t_new1_net_all, t_new2_net_all;
+    gettimeofday(&t_new1_net_all, &tz);           
 #endif
     /* Send to each datanode */
     for (j = 0; j < EC_N; j++)
@@ -228,7 +228,7 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
         for (i = 0; i < EC_K; i++)
         {
 #if (TEST_LOG)
-            gettimeofday(&t_new1_net_1, &tz); // ych_test
+            gettimeofday(&t_new1_net_1, &tz); 
 #endif
             cur = i * EC_N + j;
             /* Initialize thread metadata */

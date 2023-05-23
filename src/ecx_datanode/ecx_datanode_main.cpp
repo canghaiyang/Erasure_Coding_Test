@@ -146,7 +146,7 @@ void *send_one_request_datanode(void *arg)
         metadata->error_flag = EC_ERROR;
         return nullptr;
     }
-    //close(metadata->sockfd);
+    // close(metadata->sockfd);
     return nullptr;
 }
 
@@ -525,26 +525,27 @@ void *handle_client_write_new_enc(void *arg)
     {
         pthread_cond_wait((pthread_cond_t *)&cond_enc, &cond_enc_mutex);
     }
-
+    
     /* For encode and save */
     // if (metadata->cur_eck == 0) // If eck block from the first eck datanode
     if (cur_eck_enc == 0)
     {
         pthread_mutex_lock(&mutex_block_multiply_m);
-        block_multiply_m = (char *)malloc(sizeof(char) * metadata->block_size * EC_M); // Save intermediate coding block during multiplication and addition calculations
-        for (i = 0; i < EC_M; i++)                                                     // For the first multiplication calculation, no addition calculation
+        block_multiply_m = (char *)malloc(sizeof(char) * (metadata->block_size + sizeof(long)) * EC_M); // Save intermediate coding block during multiplication and addition calculations
+        for (i = 0; i < EC_M; i++)                                                                      // For the first multiplication calculation, no addition calculation
         {
             init[i] = 0;
         }
     }
     char **coding_block = (char **)malloc(sizeof(char *) * EC_M); // Convenient to save intermediate coding block
-
+                                                                 
     /* Encoded */
     int matrix_value[EC_M];
     for (i = 0; i < EC_M; i++)
     {
         matrix_value[i] = *(matrix + (i * EC_K) + metadata->cur_eck);
-        coding_block[i] = block_multiply_m + i * metadata->block_size;
+        coding_block[i] = block_multiply_m + i * (metadata->block_size + sizeof(long));
+
         /* First copy or xor any data that does not need to be multiplied by a factor */
         if (matrix_value[i] == 1)
         {
@@ -557,7 +558,6 @@ void *handle_client_write_new_enc(void *arg)
             {
                 galois_region_xor(buffer_block, coding_block[i], coding_block[i], metadata->block_size);
             }
-            continue;
         }
 
         /* Now do the data that needs to be multiplied by a factor */
@@ -577,14 +577,15 @@ void *handle_client_write_new_enc(void *arg)
             }
             init[i] = 1;
         }
+       
     }
     free(buffer_block);
     free(coding_block);
     char *tmp_block_multiply_m = nullptr;
     if (cur_eck_enc == EC_K - 1)
     {
-        tmp_block_multiply_m = (char *)malloc(sizeof(char) * metadata->block_size * EC_M); // Avoid being used by other threads before the coding blocks are transmitted completely
-        memcpy(tmp_block_multiply_m, block_multiply_m, metadata->block_size * EC_M);
+        tmp_block_multiply_m = (char *)malloc(sizeof(char) * (metadata->block_size + sizeof(long)) * EC_M); // Avoid being used by other threads before the coding blocks are transmitted completely
+        memcpy(tmp_block_multiply_m, block_multiply_m, (metadata->block_size + sizeof(long)) * EC_M);
         free(block_multiply_m);
         pthread_mutex_unlock(&mutex_block_multiply_m);
     }
@@ -633,7 +634,7 @@ void *handle_client_write_new_enc(void *arg)
         {
             pthread_mutex_lock(&mutex_buffer_next_ecx_block);
             buffer_next_ecx_block = (char *)malloc(sizeof(char) * metadata->block_size);
-            memcpy(buffer_next_ecx_block, tmp_block_multiply_m + next_ecx_datanode * metadata->block_size, metadata->block_size);
+            memcpy(buffer_next_ecx_block, tmp_block_multiply_m + next_ecx_datanode * (metadata->block_size + sizeof(long)), metadata->block_size);
             cur_block_request = cur_block_request + EC_X >= EC_N - 1 ? ecm - EC_K : cur_block_request + EC_X;
             pthread_cond_broadcast(&cond_request);
         }
@@ -679,7 +680,7 @@ void *handle_client_write_new_enc(void *arg)
                 printf("[handle_client_write_new] Failed to initialize EC_WRITE_ECX_PORT network\n");
                 return nullptr;
             }
-            metadata->data = tmp_block_multiply_m + i * metadata->block_size;
+            metadata->data = tmp_block_multiply_m + i * (metadata->block_size + sizeof(long));
             metadata->cur_eck = -1; // ecx block
             pthread_t tid_block;
             if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
@@ -711,7 +712,7 @@ void *handle_client_write_new_enc(void *arg)
                 printf("[handle_client_write_new] Failed to initialize network\n");
                 return nullptr;
             }
-            metadata->data = tmp_block_multiply_m + i * metadata->block_size;
+            metadata->data = tmp_block_multiply_m + i * (metadata->block_size + sizeof(long));
             metadata->cur_eck = -1; // ecx block
             pthread_t tid_block;
             if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
@@ -751,7 +752,7 @@ void *handle_client_write_new_enc(void *arg)
                     printf("[handle_client_write_new] Failed to initialize network\n");
                     return nullptr;
                 }
-                metadata->data = tmp_block_multiply_m + i * metadata->block_size;
+                metadata->data = tmp_block_multiply_m + i * (metadata->block_size + sizeof(long));
                 metadata->cur_eck = -1; // ecx block
                 pthread_t tid_block;
                 if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
@@ -790,7 +791,7 @@ void *handle_client_write_new_enc(void *arg)
                     printf("[handle_client_write_new] Failed to initialize network\n");
                     return nullptr;
                 }
-                metadata->data = tmp_block_multiply_m + i * metadata->block_size;
+                metadata->data = tmp_block_multiply_m + i * (metadata->block_size + sizeof(long));
                 metadata->cur_eck = -1; // ecx block
                 pthread_t tid_block;
                 if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
@@ -844,7 +845,7 @@ void *handle_client_write_new_enc(void *arg)
             {
                 tmp_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
             }
-            memcpy(tmp_block, tmp_block_multiply_m + local_ecx_datanode * metadata->block_size, metadata->block_size);
+            memcpy(tmp_block, tmp_block_multiply_m + local_ecx_datanode * (metadata->block_size + sizeof(long)), metadata->block_size);
             pthread_mutex_lock(&mutex_block_count);
             block_count++;
             pthread_mutex_unlock(&mutex_block_count);
