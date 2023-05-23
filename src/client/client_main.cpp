@@ -272,7 +272,7 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
             time_new /= 1000000.0;
             time_new += t_new2_net_1.tv_sec;
             time_new -= t_new1_net_1.tv_sec;
-            printf("ych_test 1 round time = %0.10f\n", time_new);
+            printf("[send_blocks_eck_datanodes] 1 block send time = %0.10f\n", time_new);
 #endif
 
 #endif
@@ -296,14 +296,14 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
 #endif
 
 #if (TEST_LOG)
-    gettimeofday(&t_new2_net_all, &tz); // ych_test
+    gettimeofday(&t_new2_net_all, &tz); 
     time_new = 0.0;
     time_new += t_new2_net_all.tv_usec;
     time_new -= t_new1_net_all.tv_usec;
     time_new /= 1000000.0;
     time_new += t_new2_net_all.tv_sec;
     time_new -= t_new1_net_all.tv_sec;
-    printf("ych_test 1 round time = %0.10f\n", time_new);
+    printf("[send_blocks_eck_datanodes] EC_N blocks send time = %0.10f\n", time_new);
 #endif
     /* check if error */
     for (j = 0; j < EC_N; j++)

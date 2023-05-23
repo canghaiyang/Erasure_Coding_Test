@@ -146,7 +146,7 @@ void *send_one_request_datanode(void *arg)
         metadata->error_flag = EC_ERROR;
         return nullptr;
     }
-    close(metadata->sockfd);
+    //close(metadata->sockfd);
     return nullptr;
 }
 
@@ -325,7 +325,7 @@ void *handle_client_write_ecx(void *arg)
     else
     {
 
-        printf("[handle_client_write_ecx] RECV ECX BLOCK\n");
+        printf("[handle_client_write_ecx] RECV ECX BLOCK :CUR_ECK = %d CUR_BLOCK = %d\n", metadata->cur_eck, metadata->cur_block);
     }
 #endif
 
@@ -374,7 +374,6 @@ void *handle_client_write_ecx(void *arg)
         printf("[handle_client_write_ecx] Failed to send block data response to ecx datanode\n");
         return nullptr;
     }
-
     pthread_mutex_lock(&mutex_block_count);
     block_count++;
     pthread_mutex_unlock(&mutex_block_count);
@@ -471,7 +470,7 @@ void *handle_client_write_request(void *arg)
 #if (TEST_LOG)
     else
     {
-        printf("[handle_client_write_request] RECV ECX REQUEST BLOCK\n");
+        printf("[handle_client_write_request] RECV ECX REQUEST BLOCK :CUR_ECK = %d CUR_BLOCK = %d\n", metadata->cur_eck, metadata->cur_block);
     }
 #endif
     pthread_mutex_lock(&cond_request_mutex);
@@ -514,13 +513,413 @@ void *handle_client_write_request(void *arg)
     free(metadata);
     return nullptr;
 }
+
+void *handle_client_write_new_enc(void *arg)
+{
+    metadata_t *metadata = (metadata_t *)arg;
+    char *buffer_block = metadata->data;
+    int i;
+    int tmp_return;
+    pthread_mutex_lock(&cond_enc_mutex);
+    while (metadata->cur_eck != cur_eck_enc || metadata->cur_block != cur_block_enc)
+    {
+        pthread_cond_wait((pthread_cond_t *)&cond_enc, &cond_enc_mutex);
+    }
+
+    /* For encode and save */
+    // if (metadata->cur_eck == 0) // If eck block from the first eck datanode
+    if (cur_eck_enc == 0)
+    {
+        pthread_mutex_lock(&mutex_block_multiply_m);
+        block_multiply_m = (char *)malloc(sizeof(char) * metadata->block_size * EC_M); // Save intermediate coding block during multiplication and addition calculations
+        for (i = 0; i < EC_M; i++)                                                     // For the first multiplication calculation, no addition calculation
+        {
+            init[i] = 0;
+        }
+    }
+    char **coding_block = (char **)malloc(sizeof(char *) * EC_M); // Convenient to save intermediate coding block
+
+    /* Encoded */
+    int matrix_value[EC_M];
+    for (i = 0; i < EC_M; i++)
+    {
+        matrix_value[i] = *(matrix + (i * EC_K) + metadata->cur_eck);
+        coding_block[i] = block_multiply_m + i * metadata->block_size;
+        /* First copy or xor any data that does not need to be multiplied by a factor */
+        if (matrix_value[i] == 1)
+        {
+            if (init[i] == 0)
+            {
+                memcpy(coding_block[i], buffer_block, metadata->block_size);
+                init[i] = 1;
+            }
+            else
+            {
+                galois_region_xor(buffer_block, coding_block[i], coding_block[i], metadata->block_size);
+            }
+            continue;
+        }
+
+        /* Now do the data that needs to be multiplied by a factor */
+        if (matrix_value[i] != 0 && matrix_value[i] != 1)
+        {
+            switch (EC_W)
+            {
+            case 8:
+                galois_w08_region_multiply(buffer_block, matrix_value[i], metadata->block_size, coding_block[i], init[i]); // init这里首次进入不会加，第二次进入会加
+                break;
+            case 16:
+                galois_w16_region_multiply(buffer_block, matrix_value[i], metadata->block_size, coding_block[i], init[i]);
+                break;
+            case 32:
+                galois_w32_region_multiply(buffer_block, matrix_value[i], metadata->block_size, coding_block[i], init[i]);
+                break;
+            }
+            init[i] = 1;
+        }
+    }
+    free(buffer_block);
+    free(coding_block);
+    char *tmp_block_multiply_m = nullptr;
+    if (cur_eck_enc == EC_K - 1)
+    {
+        tmp_block_multiply_m = (char *)malloc(sizeof(char) * metadata->block_size * EC_M); // Avoid being used by other threads before the coding blocks are transmitted completely
+        memcpy(tmp_block_multiply_m, block_multiply_m, metadata->block_size * EC_M);
+        free(block_multiply_m);
+        pthread_mutex_unlock(&mutex_block_multiply_m);
+    }
+
+    if (cur_eck_enc == EC_K - 1)
+    {
+        cur_eck_enc = 0;
+        cur_block_enc = cur_block_enc + EC_X >= EC_N ? ecm - EC_K : cur_block_enc + EC_X;
+    }
+    else
+    {
+        cur_eck_enc++;
+    }
+
+    pthread_cond_broadcast(&cond_enc);
+    pthread_mutex_unlock(&cond_enc_mutex);
+    /* If is last cur eck block */
+    if (metadata->cur_eck == EC_K - 1)
+    {
+        pthread_mutex_lock(&cond_request_ecx_mutex);
+        while (metadata->cur_block != cur_block_request_ecx)
+        {
+            pthread_cond_wait((pthread_cond_t *)&cond_request_ecx, &cond_request_ecx_mutex);
+        }
+        /* Prepare */
+
+        int next_next_ecx_datanode = (metadata->cur_block + 2) % EC_X;
+        int next_ecx_datanode = (metadata->cur_block + 1) % EC_X;
+        int local_ecx_datanode = metadata->cur_block % EC_X;
+        int prev_ecx_datanode = (metadata->cur_block - 1 + EC_X) % EC_X;
+        if (block_count == -1) // If is the first round block
+        {
+            pthread_mutex_lock(&mutex_block_count);
+            block_count = 0;
+            pthread_mutex_unlock(&mutex_block_count);
+            buffer_chunk = (char *)malloc(sizeof(char) * metadata->chunk_size);
+        }
+
+#if (EC_X > 1)
+#if (EC_X <= EC_M)
+        /* Save for next ecx datanode */
+        if (metadata->cur_block != EC_N - 1)
+#else
+        if (metadata->cur_block != EC_N - 1 && (local_ecx_datanode < EC_M - 1 || local_ecx_datanode == EC_X - 1))
+#endif
+        {
+            pthread_mutex_lock(&mutex_buffer_next_ecx_block);
+            buffer_next_ecx_block = (char *)malloc(sizeof(char) * metadata->block_size);
+            memcpy(buffer_next_ecx_block, tmp_block_multiply_m + next_ecx_datanode * metadata->block_size, metadata->block_size);
+            cur_block_request = cur_block_request + EC_X >= EC_N - 1 ? ecm - EC_K : cur_block_request + EC_X;
+            pthread_cond_broadcast(&cond_request);
+        }
+
+        /* Send coding blocks request to previous ecx datanode */
+        pthread_t tid_request;
+        metadata_t *tmp_metadata;
+        if (metadata->cur_block != 0 && local_ecx_datanode < EC_M) // No the first block and is coding datanode
+        {
+            tmp_metadata = (metadata_t *)malloc(sizeof(metadata_t));
+            memcpy(tmp_metadata, metadata, sizeof(metadata_t));
+            int tmp_return = initialize_network(&tmp_metadata->sockfd, EC_WRITE_REQUEST_BASE_PORT + (ecm - EC_K - 1 + EC_X) % EC_X, EC_K + prev_ecx_datanode);
+            if (tmp_return == EC_ERROR)
+            {
+                printf("[send_one_request_datanode] Failed to initialize network\n");
+                return nullptr;
+            }
+            tmp_metadata->cur_eck = -2; // ecx block request
+            if (pthread_create(&tid_request, NULL, send_one_request_datanode, (void *)tmp_metadata) != 0)
+            {
+                printf("[handle_client_write_new] Failed to create send one block thread\n");
+                return nullptr;
+            }
+        }
+#endif
+
+        /* Send coding blocks to ecm datanode, not send to coding datanode that also is next ecx datanode */
+#if (EC_X <= EC_M)
+        if (metadata->cur_block == EC_N - 1) // The last block, send all other coding datanodes
+        {
+            i = next_ecx_datanode;
+        }
+        else
+        {
+            i = next_next_ecx_datanode;
+        }
+
+        while (i != local_ecx_datanode) // First send to the next ecx datanode
+        {
+            tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_ECX_BASE_PORT + local_ecx_datanode, EC_K + i);
+            if (tmp_return == EC_ERROR)
+            {
+                printf("[handle_client_write_new] Failed to initialize EC_WRITE_ECX_PORT network\n");
+                return nullptr;
+            }
+            metadata->data = tmp_block_multiply_m + i * metadata->block_size;
+            metadata->cur_eck = -1; // ecx block
+            pthread_t tid_block;
+            if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
+            {
+                printf("[handle_client_write_new] Failed to create send one block thread\n");
+                return nullptr;
+            }
+            /* Wait until thread end */
+            if (pthread_join(tid_block, nullptr) != 0)
+            {
+                printf("[handle_client_write_new] Failed to join thread\n");
+                return nullptr;
+            }
+            close(metadata->sockfd);
+            i++;
+            if (i >= EC_X)
+            {
+                i = i % EC_X;
+            }
+        }
+
+#if (EC_X < EC_M)
+        for (i = EC_X; i < EC_M; i++) // Then send to ecm datanode
+        {
+            /* Initialize thread metadata */
+            tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_ECX_BASE_PORT + local_ecx_datanode, EC_K + i);
+            if (tmp_return == EC_ERROR)
+            {
+                printf("[handle_client_write_new] Failed to initialize network\n");
+                return nullptr;
+            }
+            metadata->data = tmp_block_multiply_m + i * metadata->block_size;
+            metadata->cur_eck = -1; // ecx block
+            pthread_t tid_block;
+            if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
+            {
+                printf("[handle_client_write_new] Failed to create send one block thread\n");
+                return nullptr;
+            }
+
+            /* Wait until thread end */
+            if (pthread_join(tid_block, nullptr) != 0)
+            {
+                printf("[handle_client_write_new] Failed to join thread\n");
+                return nullptr;
+            }
+            close(metadata->sockfd);
+        }
+#endif
+#else
+        if (local_ecx_datanode < EC_M)
+        {
+            if (local_ecx_datanode + 1 == EC_M || metadata->cur_block == EC_N - 1) // The last coding datanode or the last block, send all other coding datanodes
+            {
+                i = (local_ecx_datanode + 1) % EC_M;
+            }
+            else
+            {
+                i = (local_ecx_datanode + 2) % EC_M;
+            }
+
+            /* First send to ecm datanode*/
+            while (i != local_ecx_datanode)
+            {
+                /* Initialize thread metadata */
+                tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_ECX_BASE_PORT + local_ecx_datanode, EC_K + i);
+                if (tmp_return == EC_ERROR)
+                {
+                    printf("[handle_client_write_new] Failed to initialize network\n");
+                    return nullptr;
+                }
+                metadata->data = tmp_block_multiply_m + i * metadata->block_size;
+                metadata->cur_eck = -1; // ecx block
+                pthread_t tid_block;
+                if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
+                {
+                    printf("[handle_client_write_new] Failed to create send one block thread\n");
+                    return nullptr;
+                }
+
+                /* Wait until thread end */
+                if (pthread_join(tid_block, nullptr) != 0)
+                {
+                    printf("[handle_client_write_new] Failed to join thread\n");
+                    return nullptr;
+                }
+                close(metadata->sockfd);
+                i++;
+                if (i >= EC_M)
+                {
+                    i = i % EC_M;
+                }
+            }
+        }
+        else
+        {
+            /* Send coding blocks to ecm datanode */
+            for (i = 0; i < EC_M; i++)
+            {
+                if (local_ecx_datanode == EC_X - 1 && i == 0 && metadata->cur_block != EC_N - 1) // Next ecx datanode is coding datanode, should skip
+                {
+                    continue;
+                }
+                /* Initialize thread metadata */
+                tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_ECX_BASE_PORT + local_ecx_datanode, EC_K + i);
+                if (tmp_return == EC_ERROR)
+                {
+                    printf("[handle_client_write_new] Failed to initialize network\n");
+                    return nullptr;
+                }
+                metadata->data = tmp_block_multiply_m + i * metadata->block_size;
+                metadata->cur_eck = -1; // ecx block
+                pthread_t tid_block;
+                if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
+                {
+                    printf("[handle_client_write_new] Failed to create send one block thread\n");
+                    return nullptr;
+                }
+
+                /* Wait until thread end */
+                if (pthread_join(tid_block, nullptr) != 0)
+                {
+                    printf("[handle_client_write_new] Failed to join thread\n");
+                    return nullptr;
+                }
+                close(metadata->sockfd);
+            }
+        }
+#endif
+
+#if (EC_X > 1)
+        /* Send ECX block and request ECX block in parallel */
+        if (metadata->cur_block != 0 && local_ecx_datanode < EC_M) // Not the first block and is coding datanode
+        {
+            /* Wait until thread end */
+            if (pthread_join(tid_request, nullptr) != 0)
+            {
+                printf("[handle_client_write_new] Failed to join thread\n");
+                return nullptr;
+            }
+            pthread_mutex_lock(&mutex_block_count);
+            block_count++;
+            pthread_mutex_unlock(&mutex_block_count);
+            close(tmp_metadata->sockfd);
+            free(tmp_metadata);
+        }
+#endif
+
+        cur_block_request_ecx = cur_block_request_ecx + EC_X >= EC_N ? ecm - EC_K : cur_block_request_ecx + EC_X;
+        pthread_cond_broadcast(&cond_request_ecx);
+        pthread_mutex_unlock(&cond_request_ecx_mutex);
+
+        /* Save coding block */
+        char *tmp_block = nullptr;
+        if (local_ecx_datanode < EC_M)
+        {
+            if (metadata->cur_block == 0)
+            {
+                tmp_block = buffer_chunk;
+            }
+            else
+            {
+                tmp_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
+            }
+            memcpy(tmp_block, tmp_block_multiply_m + local_ecx_datanode * metadata->block_size, metadata->block_size);
+            pthread_mutex_lock(&mutex_block_count);
+            block_count++;
+            pthread_mutex_unlock(&mutex_block_count);
+        }
+        free(tmp_block_multiply_m);
+
+        if (block_count == EC_N) // Only cur_block is last block
+        {
+            /* create thread to handle file IO */
+            pthread_t tid;
+            tmp_return = replace_filename_suffix(metadata->dst_filename_datanode, ecm + 1);
+            if (tmp_return == EC_ERROR)
+            {
+                printf("[handle_client_write_new] Failed to replace_filename_suffix\n");
+                return nullptr;
+            }
+            metadata->data = buffer_chunk;
+            if (pthread_create(&tid, NULL, handle_file_io, (void *)metadata) != 0)
+            {
+                printf("[handle_client_write_new] Failed to create IO thread\n");
+                return nullptr;
+            }
+            /* Wait until thread end */
+            if (pthread_join(tid, nullptr) != 0)
+            {
+                printf("[handle_client_write_new] Failed to join thread\n");
+                return nullptr;
+            }
+            free(buffer_chunk);
+            pthread_mutex_lock(&mutex_block_count);
+            block_count = -1;
+            pthread_mutex_unlock(&mutex_block_count);
+
+            /* Send one chunk ok to client */
+            /* Initialize thread metadata */
+            tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, -1);
+            if (tmp_return == EC_ERROR)
+            {
+                printf("[handle_client_write_new] Failed to initialize network\n");
+                return nullptr;
+            }
+            /* Send chunk ok and recv response */
+            int chunk_ok = 1;
+            if (send(metadata->sockfd, &chunk_ok, sizeof(chunk_ok), 0) < 0)
+            {
+                printf("[handle_client_write_new] Failed to send block metadata to datanode\n");
+                metadata->error_flag = EC_ERROR;
+                return nullptr;
+            }
+            int error_response = 0;
+            if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
+            {
+                printf("[handle_client_write_new] Failed to recv response \n");
+                metadata->error_flag = EC_ERROR;
+                return nullptr;
+            }
+            if (error_response == 0)
+            {
+                printf("[handle_client_write_new] Failed to recv response \n");
+                metadata->error_flag = EC_ERROR;
+                return nullptr;
+            }
+            close(metadata->sockfd);
+        }
+    }
+    free(metadata);
+    return nullptr;
+}
+
 void *handle_client_write_new(void *arg)
 {
     int client_fd = *((int *)arg);
     while (1)
     {
         int i;
-        char *tmp_block = nullptr;
         int tmp_return;
         metadata_t *metadata = (metadata_t *)malloc(sizeof(metadata_t));
         int error_response = 0;
@@ -547,7 +946,7 @@ void *handle_client_write_new(void *arg)
                 pthread_cond_wait((pthread_cond_t *)&cond_net, &cond_net_mutex);
             }
 #if (TEST_LOG)
-            printf("[handle_client_write_new] RECV ECK BLOCK: CUR_ECK = %d\n", metadata->cur_eck); // Print information
+            printf("[handle_client_write_new] RECV ECK BLOCK: CUR_ECK = %d CUR_BLOCK = %d\n", metadata->cur_eck, metadata->cur_block); // Print information
 #endif
             /* recv eck block data and send response */
             char *buffer_block = (char *)malloc(sizeof(char) * metadata->block_size); // Save recv block, not conflict with other threads
@@ -581,399 +980,16 @@ void *handle_client_write_new(void *arg)
             {
                 cur_eck_net++;
             }
+            metadata->data = buffer_block;
+            pthread_t tid_enc;
+            if (pthread_create(&tid_enc, NULL, handle_client_write_new_enc, (void *)metadata) != 0)
+            {
+                printf("[handle_client_write_new] Failed to create enc thread\n");
+                return nullptr;
+            }
+
             pthread_cond_broadcast(&cond_net);
             pthread_mutex_unlock(&cond_net_mutex);
-
-            pthread_mutex_lock(&cond_enc_mutex);
-            while (metadata->cur_eck != cur_eck_enc || metadata->cur_block != cur_block_enc)
-            {
-                pthread_cond_wait((pthread_cond_t *)&cond_enc, &cond_enc_mutex);
-            }
-
-            /* For encode and save */
-            // if (metadata->cur_eck == 0) // If eck block from the first eck datanode
-            if (cur_eck_enc == 0)
-            {
-                pthread_mutex_lock(&mutex_block_multiply_m);
-                block_multiply_m = (char *)malloc(sizeof(char) * metadata->block_size * EC_M); // Save intermediate coding block during multiplication and addition calculations
-                for (i = 0; i < EC_M; i++)                                                     // For the first multiplication calculation, no addition calculation
-                {
-                    init[i] = 0;
-                }
-            }
-
-            char **coding_block = (char **)malloc(sizeof(char *) * EC_M); // Convenient to save intermediate coding block
-
-            /* Encoded */
-            int matrix_value[EC_M];
-            for (i = 0; i < EC_M; i++)
-            {
-                matrix_value[i] = *(matrix + (i * EC_K) + metadata->cur_eck);
-                coding_block[i] = block_multiply_m + i * metadata->block_size;
-                /* First copy or xor any data that does not need to be multiplied by a factor */
-                if (matrix_value[i] == 1)
-                {
-                    if (init[i] == 0)
-                    {
-                        memcpy(coding_block[i], buffer_block, metadata->block_size);
-                        init[i] = 1;
-                    }
-                    else
-                    {
-                        galois_region_xor(buffer_block, coding_block[i], coding_block[i], metadata->block_size);
-                    }
-                    continue;
-                }
-
-                /* Now do the data that needs to be multiplied by a factor */
-                if (matrix_value[i] != 0 && matrix_value[i] != 1)
-                {
-                    switch (EC_W)
-                    {
-                    case 8:
-                        galois_w08_region_multiply(buffer_block, matrix_value[i], metadata->block_size, coding_block[i], init[i]); // init这里首次进入不会加，第二次进入会加
-                        break;
-                    case 16:
-                        galois_w16_region_multiply(buffer_block, matrix_value[i], metadata->block_size, coding_block[i], init[i]);
-                        break;
-                    case 32:
-                        galois_w32_region_multiply(buffer_block, matrix_value[i], metadata->block_size, coding_block[i], init[i]);
-                        break;
-                    }
-                    init[i] = 1;
-                }
-            }
-            free(buffer_block);
-            free(coding_block);
-            if (cur_eck_enc == EC_K - 1)
-            {
-                cur_eck_enc = 0;
-                cur_block_enc = cur_block_enc + EC_X >= EC_N ? ecm - EC_K : cur_block_enc + EC_X;
-            }
-            else
-            {
-                cur_eck_enc++;
-            }
-            char *tmp_block_multiply_m = nullptr;
-            if (metadata->cur_eck == EC_K - 1)
-            {
-                tmp_block_multiply_m = (char *)malloc(sizeof(char) * metadata->block_size * EC_M); // Avoid being used by other threads before the coding blocks are transmitted completely
-                memcpy(tmp_block_multiply_m, block_multiply_m, metadata->block_size * EC_M);
-                free(block_multiply_m);
-                pthread_mutex_unlock(&mutex_block_multiply_m);
-            }
-            pthread_cond_broadcast(&cond_enc);
-            pthread_mutex_unlock(&cond_enc_mutex);
-
-            /* If is last cur eck block */
-            if (metadata->cur_eck == EC_K - 1)
-            {
-                pthread_mutex_lock(&cond_request_ecx_mutex);
-                while (metadata->cur_block != cur_block_request_ecx)
-                {
-                    pthread_cond_wait((pthread_cond_t *)&cond_request_ecx, &cond_request_ecx_mutex);
-                }
-                /* Prepare */
-
-                int next_next_ecx_datanode = (metadata->cur_block + 2) % EC_X;
-                int next_ecx_datanode = (metadata->cur_block + 1) % EC_X;
-                int local_ecx_datanode = metadata->cur_block % EC_X;
-                int prev_ecx_datanode = (metadata->cur_block - 1 + EC_X) % EC_X;
-                if (block_count == -1) // If is the first round block
-                {
-                    pthread_mutex_lock(&mutex_block_count);
-                    block_count = 0;
-                    pthread_mutex_unlock(&mutex_block_count);
-                    buffer_chunk = (char *)malloc(sizeof(char) * metadata->chunk_size);
-                }
-
-#if (EC_X > 1)
-#if (EC_X <= EC_M)
-                /* Save for next ecx datanode */
-                if (metadata->cur_block != EC_N - 1)
-#else
-                if (metadata->cur_block != EC_N - 1 && (local_ecx_datanode < EC_M - 1 || local_ecx_datanode == EC_X - 1))
-#endif
-                {
-                    pthread_mutex_lock(&mutex_buffer_next_ecx_block);
-                    buffer_next_ecx_block = (char *)malloc(sizeof(char) * metadata->block_size);
-                    memcpy(buffer_next_ecx_block, tmp_block_multiply_m + next_ecx_datanode * metadata->block_size, metadata->block_size);
-                    cur_block_request = cur_block_request + EC_X >= EC_N - 1 ? ecm - EC_K : cur_block_request + EC_X;
-                    pthread_cond_broadcast(&cond_request);
-                }
-
-                /* Send coding blocks request to previous ecx datanode */
-                pthread_t tid_request;
-                metadata_t *tmp_metadata;
-                if (metadata->cur_block != 0 && local_ecx_datanode < EC_M) // No the first block and is coding datanode
-                {
-                    tmp_metadata = (metadata_t *)malloc(sizeof(metadata_t));
-                    memcpy(tmp_metadata, metadata, sizeof(metadata_t));
-                    int tmp_return = initialize_network(&tmp_metadata->sockfd, EC_WRITE_REQUEST_BASE_PORT + (ecm - EC_K - 1 + EC_X) % EC_X, EC_K + prev_ecx_datanode);
-                    if (tmp_return == EC_ERROR)
-                    {
-                        printf("[send_one_request_datanode] Failed to initialize network\n");
-                        return nullptr;
-                    }
-                    tmp_metadata->cur_eck = -2; // ecx block request
-                    if (pthread_create(&tid_request, NULL, send_one_request_datanode, (void *)tmp_metadata) != 0)
-                    {
-                        printf("[handle_client_write_new] Failed to create send one block thread\n");
-                        return nullptr;
-                    }
-                }
-#endif
-
-                /* Send coding blocks to ecm datanode, not send to coding datanode that also is next ecx datanode */
-#if (EC_X <= EC_M)
-                if (metadata->cur_block == EC_N - 1) // The last block, send all other coding datanodes
-                {
-                    i = next_ecx_datanode;
-                }
-                else
-                {
-                    i = next_next_ecx_datanode;
-                }
-
-                while (i != local_ecx_datanode) // First send to the next ecx datanode
-                {
-                    tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_ECX_BASE_PORT + local_ecx_datanode, EC_K + i);
-                    if (tmp_return == EC_ERROR)
-                    {
-                        printf("[handle_client_write_new] Failed to initialize EC_WRITE_ECX_PORT network\n");
-                        return nullptr;
-                    }
-                    metadata->data = tmp_block_multiply_m + i * metadata->block_size;
-                    metadata->cur_eck = -1; // ecx block
-
-                    pthread_t tid_block;
-                    if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
-                    {
-                        printf("[handle_client_write_new] Failed to create send one block thread\n");
-                        return nullptr;
-                    }
-                    /* Wait until thread end */
-                    if (pthread_join(tid_block, nullptr) != 0)
-                    {
-                        printf("[handle_client_write_new] Failed to join thread\n");
-                        return nullptr;
-                    }
-                    close(metadata->sockfd);
-                    i++;
-                    if (i >= EC_X)
-                    {
-                        i = i % EC_X;
-                    }
-                }
-
-#if (EC_X < EC_M)
-                for (i = EC_X; i < EC_M; i++) // Then send to ecm datanode
-                {
-                    /* Initialize thread metadata */
-                    tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, EC_K + i);
-                    if (tmp_return == EC_ERROR)
-                    {
-                        printf("[handle_client_write_new] Failed to initialize network\n");
-                        return nullptr;
-                    }
-                    metadata->data = tmp_block_multiply_m + i * metadata->block_size;
-                    metadata->cur_eck = -1; // ecx block
-                    pthread_t tid_block;
-                    if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
-                    {
-                        printf("[handle_client_write_new] Failed to create send one block thread\n");
-                        return nullptr;
-                    }
-
-                    /* Wait until thread end */
-                    if (pthread_join(tid_block, nullptr) != 0)
-                    {
-                        printf("[handle_client_write_new] Failed to join thread\n");
-                        return nullptr;
-                    }
-                    close(metadata->sockfd);
-                }
-#endif
-#else
-                if (local_ecx_datanode < EC_M)
-                {
-                    if (local_ecx_datanode + 1 == EC_M || metadata->cur_block == EC_N - 1) // The last coding datanode or the last block, send all other coding datanodes
-                    {
-                        i = (local_ecx_datanode + 1) % EC_M;
-                    }
-                    else
-                    {
-                        i = (local_ecx_datanode + 2) % EC_M;
-                    }
-
-                    /* First send to ecm datanode*/
-                    while (i != local_ecx_datanode)
-                    {
-                        /* Initialize thread metadata */
-                        tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, EC_K + i);
-                        if (tmp_return == EC_ERROR)
-                        {
-                            printf("[handle_client_write_new] Failed to initialize network\n");
-                            return nullptr;
-                        }
-                        metadata->data = tmp_block_multiply_m + i * metadata->block_size;
-                        metadata->cur_eck = -1; // ecx block
-                        pthread_t tid_block;
-                        if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
-                        {
-                            printf("[handle_client_write_new] Failed to create send one block thread\n");
-                            return nullptr;
-                        }
-
-                        /* Wait until thread end */
-                        if (pthread_join(tid_block, nullptr) != 0)
-                        {
-                            printf("[handle_client_write_new] Failed to join thread\n");
-                            return nullptr;
-                        }
-                        close(metadata->sockfd);
-                        i++;
-                        if (i >= EC_M)
-                        {
-                            i = i % EC_M;
-                        }
-                    }
-                }
-                else
-                {
-                    /* Send coding blocks to ecm datanode */
-                    for (i = 0; i < EC_M; i++)
-                    {
-                        if (local_ecx_datanode == EC_X - 1 && i == 0 && metadata->cur_block != EC_N - 1) // Next ecx datanode is coding datanode, should skip
-                        {
-                            continue;
-                        }
-                        /* Initialize thread metadata */
-                        tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, EC_K + i);
-                        if (tmp_return == EC_ERROR)
-                        {
-                            printf("[handle_client_write_new] Failed to initialize network\n");
-                            return nullptr;
-                        }
-                        metadata->data = tmp_block_multiply_m + i * metadata->block_size;
-                        metadata->cur_eck = -1; // ecx block
-                        pthread_t tid_block;
-                        if (pthread_create(&tid_block, NULL, send_one_block_datanode, (void *)metadata) != 0)
-                        {
-                            printf("[handle_client_write_new] Failed to create send one block thread\n");
-                            return nullptr;
-                        }
-
-                        /* Wait until thread end */
-                        if (pthread_join(tid_block, nullptr) != 0)
-                        {
-                            printf("[handle_client_write_new] Failed to join thread\n");
-                            return nullptr;
-                        }
-                        close(metadata->sockfd);
-                    }
-                }
-#endif
-
-#if (EC_X > 1)
-                /* Send ECX block and request ECX block in parallel */
-                if (metadata->cur_block != 0 && local_ecx_datanode < EC_M) // Not the first block and is coding datanode
-                {
-                    /* Wait until thread end */
-                    if (pthread_join(tid_request, nullptr) != 0)
-                    {
-                        printf("[handle_client_write_new] Failed to join thread\n");
-                        return nullptr;
-                    }
-                    pthread_mutex_lock(&mutex_block_count);
-                    block_count++;
-                    pthread_mutex_unlock(&mutex_block_count);
-                    close(tmp_metadata->sockfd);
-                    free(tmp_metadata);
-                }
-#endif
-
-                cur_block_request_ecx = cur_block_request_ecx + EC_X >= EC_N ? ecm - EC_K : cur_block_request_ecx + EC_X;
-                pthread_cond_broadcast(&cond_request_ecx);
-                pthread_mutex_unlock(&cond_request_ecx_mutex);
-
-                /* Save coding block */
-                if (local_ecx_datanode < EC_M)
-                {
-                    if (metadata->cur_block == 0)
-                    {
-                        tmp_block = buffer_chunk;
-                    }
-                    else
-                    {
-                        tmp_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
-                    }
-                    memcpy(tmp_block, tmp_block_multiply_m + local_ecx_datanode * metadata->block_size, metadata->block_size);
-                    pthread_mutex_lock(&mutex_block_count);
-                    block_count++;
-                    pthread_mutex_unlock(&mutex_block_count);
-                }
-                free(tmp_block_multiply_m);
-
-                if (block_count == EC_N) // Only cur_block is last block
-                {
-                    /* create thread to handle file IO */
-                    pthread_t tid;
-                    tmp_return = replace_filename_suffix(metadata->dst_filename_datanode, ecm + 1);
-                    if (tmp_return == EC_ERROR)
-                    {
-                        printf("[handle_client_write_new] Failed to replace_filename_suffix\n");
-                        return nullptr;
-                    }
-                    metadata->data = buffer_chunk;
-                    if (pthread_create(&tid, NULL, handle_file_io, (void *)metadata) != 0)
-                    {
-                        printf("[handle_client_write_new] Failed to create IO thread\n");
-                        return nullptr;
-                    }
-                    /* Wait until thread end */
-                    if (pthread_join(tid, nullptr) != 0)
-                    {
-                        printf("[handle_client_write_new] Failed to join thread\n");
-                        return nullptr;
-                    }
-                    free(buffer_chunk);
-                    pthread_mutex_lock(&mutex_block_count);
-                    block_count = -1;
-                    pthread_mutex_unlock(&mutex_block_count);
-
-                    /* Send one chunk ok to client */
-                    /* Initialize thread metadata */
-                    tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, -1);
-                    if (tmp_return == EC_ERROR)
-                    {
-                        printf("[handle_client_write_new] Failed to initialize network\n");
-                        return nullptr;
-                    }
-                    /* Send chunk ok and recv response */
-                    int chunk_ok = 1;
-                    if (send(metadata->sockfd, &chunk_ok, sizeof(chunk_ok), 0) < 0)
-                    {
-                        printf("[handle_client_write_new] Failed to send block metadata to datanode\n");
-                        metadata->error_flag = EC_ERROR;
-                        return nullptr;
-                    }
-                    int error_response = 0;
-                    if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
-                    {
-                        printf("[handle_client_write_new] Failed to recv response \n");
-                        metadata->error_flag = EC_ERROR;
-                        return nullptr;
-                    }
-                    if (error_response == 0)
-                    {
-                        printf("[handle_client_write_new] Failed to recv response \n");
-                        metadata->error_flag = EC_ERROR;
-                        return nullptr;
-                    }
-                    close(metadata->sockfd);
-                }
-            }
         }
         else
         {
@@ -982,10 +998,8 @@ void *handle_client_write_new(void *arg)
         }
         if (metadata->cur_block >= EC_N - EC_X)
         {
-            free(metadata);
             break;
         }
-        free(metadata);
     }
     close(client_fd);
     return nullptr;
@@ -994,8 +1008,6 @@ void *handle_client_write_new(void *arg)
 void *handle_client_write(void *arg)
 {
     int client_fd = *((int *)arg);
-    int i;
-    char *tmp_block = nullptr;
     int tmp_return;
     metadata_t *metadata = (metadata_t *)malloc(sizeof(metadata_t));
     int error_response = 0;
@@ -1177,7 +1189,7 @@ void *client_write_request(void *arg)
         /* create thread to handle client send */
         if (pthread_create(&tid, NULL, handle_client_write_request, (void *)&client_fd) != 0)
         {
-            printf("[client_write] Failed to create handle_client_write_requestthread\n");
+            printf("[client_write] Failed to create handle_client_write_request thread\n");
             continue;
         }
     }

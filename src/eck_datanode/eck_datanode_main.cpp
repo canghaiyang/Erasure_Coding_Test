@@ -24,6 +24,8 @@ pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
 int eck;
 
+int sockfd_array[EC_X];
+
 void *send_one_block_datanode(void *arg)
 {
     metadata_t *metadata = (metadata_t *)arg;
@@ -200,23 +202,112 @@ void *handle_file_io(void *arg)
     metadata = nullptr;
     return nullptr;
 }
+void *handle_client_write_new_ecx(void *arg)
+{
+    metadata_t *metadata = (metadata_t *)arg;
+    int error_response = 0;
+
+    pthread_mutex_lock(&cond_mutex);
+    while (metadata->cur_block != cur_block)
+    {
+        pthread_cond_wait((pthread_cond_t *)&cond, &cond_mutex);
+    }
+
+    /* Send ecx metadata */
+    metadata->sockfd = sockfd_array[metadata->cur_block % EC_X];
+    if (send(metadata->sockfd, metadata, sizeof(metadata_t), 0) < 0)
+    {
+        printf("[handle_client_write_new_ecx] Failed to send block metadata to datanode\n");
+        metadata->error_flag = EC_ERROR;
+        free(metadata);
+        return nullptr;
+    }
+    error_response = 0;
+    if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
+    {
+        printf("[handle_client_write_new_ecx] Failed to recv block metadata response from datanode\n");
+        perror("recv"); // print error information
+        metadata->error_flag = EC_ERROR;
+        free(metadata);
+        return nullptr;
+    }
+    if (error_response == 0)
+    {
+        printf("[handle_client_write_new_ecx] Failed to recv block metadata response from datanode\n");
+        metadata->error_flag = EC_ERROR;
+        free(metadata);
+        return nullptr;
+    }
+
+    /* Send ecx data */
+    char *buffer_block = nullptr;
+    if (metadata->cur_block == 0)
+    {
+        buffer_block = buffer_chunk;
+    }
+    else
+    {
+        buffer_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
+    }
+    metadata->data = buffer_block;
+    if (send(metadata->sockfd, metadata->data, metadata->block_size, 0) < 0)
+    {
+        printf("[send_one_block_datanode] Failed to send block data to datanode\n");
+        metadata->error_flag = EC_ERROR;
+        free(metadata);
+        return nullptr;
+    }
+
+    if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
+    {
+        printf("[send_one_block_datanode] Failed to recv block data response from datanode\n");
+        metadata->error_flag = EC_ERROR;
+        free(metadata);
+        return nullptr;
+    }
+    if (error_response == 1)
+    {
+        printf("[send_one_block_datanode] Failed to recv block data response from datanode: recv error\n");
+        metadata->error_flag = EC_ERROR;
+        free(metadata);
+        return nullptr;
+    }
+
+    cur_block = cur_block == EC_N - 1 ? 0 : cur_block + 1;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&cond_mutex);
+
+    /* If cur_block is last block ,create thread to handle file IO */
+    if (metadata->cur_block == EC_N - 1)
+    {
+        pthread_t tid;
+        metadata->data = buffer_chunk;
+        if (pthread_create(&tid, NULL, handle_file_io, (void *)metadata) != 0)
+        {
+            printf("[handle_client_write_new] Failed to create IO thread\n");
+            free(metadata->data);
+            free(metadata);
+            return nullptr;
+        }
+        for (int i = 0; i < EC_X; i++)
+        {
+            close(sockfd_array[i]);
+        }
+    }
+}
 
 void *handle_client_write_new(void *arg)
 {
     int client_fd = *((int *)arg);
-    metadata_t *metadata = (metadata_t *)malloc(sizeof(metadata_t));
-    int error_response = 0;
 
     int i;
     int tmp_return;
-    int sockfd_array[EC_X];
     for (i = 0; i < EC_X; i++)
     {
         tmp_return = initialize_network(&sockfd_array[i], EC_WRITE_ECK_BASE_PORT + eck, EC_K + i);
         if (tmp_return == EC_ERROR)
         {
             printf("[handle_client_write_new] Failed to initialize network\n");
-            free(metadata);
             close(client_fd);
             return nullptr;
         }
@@ -224,6 +315,9 @@ void *handle_client_write_new(void *arg)
 
     while (1)
     {
+        metadata_t *metadata = (metadata_t *)malloc(sizeof(metadata_t));
+        int error_response = 0;
+
         /* recv metadata and send response */
         if (recv(client_fd, metadata, sizeof(metadata_t), 0) < 0)
         {
@@ -288,86 +382,22 @@ void *handle_client_write_new(void *arg)
                 return nullptr;
             }
 
-            pthread_mutex_lock(&cond_mutex);
-            while (metadata->cur_block != cur_block)
+            pthread_t tid_ecx;
+            if (pthread_create(&tid_ecx, NULL, handle_client_write_new_ecx, (void *)metadata) != 0)
             {
-                pthread_cond_wait((pthread_cond_t *)&cond, &cond_mutex);
-            }
-
-            /* Send ecx metadata */
-            metadata->sockfd = sockfd_array[metadata->cur_block % EC_X];
-            if (send(metadata->sockfd, metadata, sizeof(metadata_t), 0) < 0)
-            {
-                printf("[send_one_block_datanode] Failed to send block metadata to datanode\n");
-                metadata->error_flag = EC_ERROR;
+                printf("[handle_client_write_new] Failed to create ecx thread\n");
+                free(metadata->data);
                 free(metadata);
                 close(client_fd);
                 return nullptr;
             }
-            error_response = 0;
-            if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
+            if (pthread_detach(tid_ecx) != 0)
             {
-                printf("[send_one_block_datanode] Failed to recv block metadata response from datanode\n");
-                perror("recv"); // print error information
-                metadata->error_flag = EC_ERROR;
-                free(metadata);
-                close(client_fd);
+                printf("Failed to detach thread.\n");
                 return nullptr;
             }
-            if (error_response == 0)
-            {
-                printf("[send_one_block_datanode] Failed to recv block metadata response from datanode\n");
-                metadata->error_flag = EC_ERROR;
-                free(metadata);
-                close(client_fd);
-                return nullptr;
-            }
-
-            /* Send ecx data */
-            metadata->data = buffer_block;
-            if (send(metadata->sockfd, metadata->data, metadata->block_size, 0) < 0)
-            {
-                printf("[send_one_block_datanode] Failed to send block data to datanode\n");
-                metadata->error_flag = EC_ERROR;
-                free(metadata);
-                close(client_fd);
-                return nullptr;
-            }
-
-            if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
-            {
-                printf("[send_one_block_datanode] Failed to recv block data response from datanode\n");
-                metadata->error_flag = EC_ERROR;
-                free(metadata);
-                close(client_fd);
-                return nullptr;
-            }
-            if (error_response == 1)
-            {
-                printf("[send_one_block_datanode] Failed to recv block data response from datanode: recv error\n");
-                metadata->error_flag = EC_ERROR;
-                free(metadata);
-                close(client_fd);
-                return nullptr;
-            }
-
-            cur_block = cur_block == EC_N - 1 ? 0 : cur_block + 1;
-            pthread_cond_broadcast(&cond);
-            pthread_mutex_unlock(&cond_mutex);
-
-            /* If cur_block is last block ,create thread to handle file IO */
             if (metadata->cur_block == EC_N - 1)
             {
-                pthread_t tid;
-                metadata->data = buffer_chunk;
-                if (pthread_create(&tid, NULL, handle_file_io, (void *)metadata) != 0)
-                {
-                    printf("[handle_client_write_new] Failed to create IO thread\n");
-                    free(metadata->data);
-                    free(metadata);
-                    close(client_fd);
-                    return nullptr;
-                }
                 break;
             }
         }
@@ -378,10 +408,6 @@ void *handle_client_write_new(void *arg)
         }
     }
 
-    for (i = 0; i < EC_X; i++)
-    {
-        close(sockfd_array[i]);
-    }
     close(client_fd);
     return nullptr;
 }
