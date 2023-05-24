@@ -9,9 +9,10 @@
 #define EC_X 3       // x number of encoded nodes
 #define EC_N 3       // a chunk is divided into N blocks, larger than or equal to EC_X
 
-#define SEND_DATANODE 1 // 1, send chunks to datanode; 0, just locally encode
-#define SEND_METHOD 1   // 1, send in serial; 0,send in parallel
-#define RECV_METHOD 1   // 1, recv in serial; 0,recv in parallel
+#define NET_BANDWIDTH_MODE 0 // 1, for differnet network bandwith; 0, just regular
+#define SEND_DATANODE 1      // 1, send chunks to datanode; 0, just locally encode
+#define SEND_METHOD 1        // 1, send in serial; 0,send in parallel
+#define RECV_METHOD 1        // 1, recv in serial; 0,recv in parallel
 
 #define WRITE_PATH "test_file/write/"                   // src_file and dst_file saved path
 #define READ_PATH "test_file/read/"                     // src_file and dst_file saved path
@@ -42,6 +43,9 @@ typedef struct metadata_s // chunk metadata and data
     char *data;                               // chunk data or block data
     char dst_filename_datanode[MAX_PATH_LEN]; // dst filename on datanode
     int error_flag;                           // check if thread error
+#if (NET_BANDWIDTH_MODE)
+    int net_block_size[EC_X];
+#endif
 } metadata_t;
 
 typedef struct encode_s // encode thread metadata
@@ -60,3 +64,5 @@ typedef struct network_s // network thread metadata
     int chunk_size;
     char *dst_filename_stripe;
 } network_t;
+
+int bwRatio[EC_X] = {10, 5, 1};

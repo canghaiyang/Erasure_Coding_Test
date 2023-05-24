@@ -180,6 +180,7 @@ void *send_one_block_datanode(void *arg)
     if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
     {
         printf("[send_one_block_datanode] Failed to recv block data response from datanode\n");
+        perror("recv"); // print error information
         metadata->error_flag = EC_ERROR;
         return nullptr;
     }
@@ -191,6 +192,191 @@ void *send_one_block_datanode(void *arg)
     }
     return nullptr;
 }
+
+#if (NET_BANDWIDTH_MODE)
+int send_blocks_eck_datanodes_net(char **block, int chunk_size, int *block_size, int remain_block_size, char *dst_filename_stripe, int client_fd)
+{
+    metadata_t metadata_array[EC_K * EC_N];
+    int sockfd_array[EC_K];
+    pthread_t tid[EC_K * EC_N];
+    int error_flag = EC_OK;
+    int cur;
+    int i, j;
+
+    int tmp_return;
+    for (i = 0; i < EC_K; i++)
+    {
+        tmp_return = initialize_network(&sockfd_array[i], EC_WRITE_NEW_PORT, i);
+        if (tmp_return == EC_ERROR)
+        {
+            printf("[send_blocks_eck_datanodes_net] Failed to initialize network\n");
+            return EC_ERROR;
+        }
+    }
+
+    /* Timing variables */
+    struct timeval t_new1, t_new2;
+
+    struct timezone tz;
+    gettimeofday(&t_new1, &tz);
+#if (TEST_LOG)
+    struct timeval t_new1_net_1, t_new2_net_1;
+    struct timeval t_new1_net_all, t_new2_net_all;
+    gettimeofday(&t_new1_net_all, &tz);
+#endif
+    /* Send to each datanode */
+    int k, l;
+    for (j = 0; j < EC_N; j++)
+    {
+        for (i = 0; i < EC_K; i++)
+        {
+#if (TEST_LOG)
+            gettimeofday(&t_new1_net_1, &tz);
+#endif
+            cur = i * EC_N + j;
+            /* Initialize thread metadata */
+            metadata_array[cur].sockfd = sockfd_array[i];
+            metadata_array[cur].chunk_size = chunk_size;
+            if (j == 0)
+            {
+                metadata_array[cur].block_size = block_size[0] + remain_block_size;
+            }
+            else
+            {
+                metadata_array[cur].block_size = block_size[j % EC_X];
+            }
+            metadata_array[cur].remain_block_size = remain_block_size;
+            metadata_array[cur].cur_block = j;
+            metadata_array[cur].cur_eck = i;
+            metadata_array[cur].data = block[cur];
+            memset(metadata_array[cur].dst_filename_datanode, 0, sizeof(metadata_array[cur].dst_filename_datanode));
+            sprintf(metadata_array[cur].dst_filename_datanode, "%s_%d", dst_filename_stripe, i + 1); // filename on datanode
+            metadata_array[cur].error_flag = EC_OK;
+            for (l = 0; l < EC_X; l++)
+            {
+                metadata_array[cur].net_block_size[l] = block_size[l];
+            }
+
+            /* Create thread to send one block to one datanode */
+            if (pthread_create(&tid[cur], NULL, send_one_block_datanode, (void *)&metadata_array[cur]) != 0)
+            {
+                printf("[send_blocks_eck_datanodes_net] Failed to create thread\n");
+                return EC_ERROR;
+            }
+
+#if (SEND_METHOD)
+            /* Wait until thread end */
+            if (pthread_join(tid[cur], nullptr) != 0)
+            {
+                printf("[send_blocks_eck_datanodes_net] Failed to join thread\n");
+                return EC_ERROR;
+            }
+#if (TEST_LOG)
+            gettimeofday(&t_new2_net_1, &tz);
+            time_new = 0.0;
+            time_new += t_new2_net_1.tv_usec;
+            time_new -= t_new1_net_1.tv_usec;
+            time_new /= 1000000.0;
+            time_new += t_new2_net_1.tv_sec;
+            time_new -= t_new1_net_1.tv_sec;
+            printf("[send_blocks_eck_datanodes_net] 1 block send time = %0.10f\n", time_new);
+#endif
+
+#endif
+        }
+    }
+
+#if (!SEND_METHOD)
+    for (j = 0; j < EC_N; j++)
+    {
+        for (i = 0; i < EC_K; i++)
+        {
+            /* Wait until thread end */
+            cur = i * EC_N + j;
+            if (pthread_join(tid[cur], nullptr) != 0)
+            {
+                printf("[send_blocks_eck_datanodes_net] Failed to join thread\n");
+                return EC_ERROR;
+            }
+        }
+    }
+#endif
+
+#if (TEST_LOG)
+    gettimeofday(&t_new2_net_all, &tz);
+    time_new = 0.0;
+    time_new += t_new2_net_all.tv_usec;
+    time_new -= t_new1_net_all.tv_usec;
+    time_new /= 1000000.0;
+    time_new += t_new2_net_all.tv_sec;
+    time_new -= t_new1_net_all.tv_sec;
+    printf("[send_blocks_eck_datanodes_net] EC_N blocks send time = %0.10f\n", time_new);
+#endif
+    /* check if error */
+    for (j = 0; j < EC_N; j++)
+    {
+        for (i = 0; i < EC_K; i++)
+        {
+            cur = i * EC_N + j;
+            error_flag += metadata_array[cur].error_flag;
+        }
+    }
+    if (error_flag != EC_OK)
+    {
+        return EC_ERROR;
+    }
+
+    int datanode_fd; // datanode socket
+    int chunk_count = EC_M;
+    struct sockaddr_in datanode_addr;
+    socklen_t datanode_addr_len = sizeof(datanode_addr);
+    pthread_t tid_client;
+
+    while (chunk_count > 0)
+    {
+        /* accept client */
+        if ((datanode_fd = accept(client_fd, (struct sockaddr *)&datanode_addr, &datanode_addr_len)) == -1)
+        {
+            printf("[send_blocks_eck_datanodes_net] Failed to accept socket\n");
+            close(client_fd);
+            return EC_ERROR;
+        }
+        /* create thread to handle client send */
+        if (pthread_create(&tid_client, NULL, handle_coding_datanode_write, (void *)&datanode_fd) != 0)
+        {
+            printf("[send_blocks_eck_datanodes_net] Failed to create write thread\n");
+            close(datanode_fd);
+            return EC_ERROR;
+        }
+        /* Wait until thread end */
+        if (pthread_join(tid[cur], nullptr) != 0)
+        {
+            printf("[send_blocks_eck_datanodes_net] Failed to join thread\n");
+            return EC_ERROR;
+        }
+        chunk_count--;
+    }
+
+    gettimeofday(&t_new2, &tz);
+    time_new = 0.0;
+    time_new += t_new2.tv_usec;
+    time_new -= t_new1.tv_usec;
+    time_new /= 1000000.0;
+    time_new += t_new2.tv_sec;
+    time_new -= t_new1.tv_sec;
+    if (time_new < time_new_min)
+    {
+        time_new_min = time_new;
+    }
+
+    for (i = 0; i < EC_K; i++)
+    {
+        close(sockfd_array[i]);
+    }
+
+    return EC_OK;
+}
+#endif
 
 int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int remain_block_size, char *dst_filename_stripe, int client_fd)
 {
@@ -218,9 +404,9 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
     struct timezone tz;
     gettimeofday(&t_new1, &tz);
 #if (TEST_LOG)
-    struct timeval t_new1_net_1, t_new2_net_1;     
+    struct timeval t_new1_net_1, t_new2_net_1;
     struct timeval t_new1_net_all, t_new2_net_all;
-    gettimeofday(&t_new1_net_all, &tz);           
+    gettimeofday(&t_new1_net_all, &tz);
 #endif
     /* Send to each datanode */
     for (j = 0; j < EC_N; j++)
@@ -228,7 +414,7 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
         for (i = 0; i < EC_K; i++)
         {
 #if (TEST_LOG)
-            gettimeofday(&t_new1_net_1, &tz); 
+            gettimeofday(&t_new1_net_1, &tz);
 #endif
             cur = i * EC_N + j;
             /* Initialize thread metadata */
@@ -296,7 +482,7 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
 #endif
 
 #if (TEST_LOG)
-    gettimeofday(&t_new2_net_all, &tz); 
+    gettimeofday(&t_new2_net_all, &tz);
     time_new = 0.0;
     time_new += t_new2_net_all.tv_usec;
     time_new -= t_new1_net_all.tv_usec;
@@ -1027,6 +1213,209 @@ static void help(int argc, char **argv)
               << "\t  \n"
               << std::endl;
 }
+#if (NET_BANDWIDTH_MODE)
+static int erasure_coding_write_ecknet(int argc, char **argv)
+{
+    printf("[erasure_coding_write_ecknet] Write fast for different network bandwidth running...\n");
+
+#if (!NET_BANDWIDTH_MODE)
+    printf("[erasure_coding_write_ecknet] NET_BANDWIDTH_MODE is 0\n");
+    return EC_ERROR;
+#endif
+
+#if (SEND_DATANODE)
+    int i, j;       // loop control variables
+    int tmp_return; // return check
+
+    /* File arguments */
+    FILE *src_fp;            // src_file pointers
+    int file_size;           // size of file
+    struct stat file_status; // finding file size
+    int reading;             // number of reading required
+    int current_reading;     // number of current reading
+    int io_flag;             // 1, all IO read; 0, padding read and IO read
+    char src_filename[MAX_PATH_LEN] = {0};
+    char dst_filename[MAX_PATH_LEN] = {0};
+    char file_size_filename[MAX_PATH_LEN] = {0};
+    char buf_filename1[MAX_PATH_LEN] = {0};
+    char buf_filename2[MAX_PATH_LEN] = {0};
+    getcwd(buf_filename1, sizeof(buf_filename1));
+    strncpy(buf_filename2, buf_filename1, strlen(buf_filename1) - 6);              // -6 to sub script/
+    sprintf(src_filename, "%s%s%s", buf_filename2, WRITE_PATH, argv[2]);           // get src_filename
+    sprintf(dst_filename, "%s%s%s", buf_filename2, WRITE_PATH, argv[3]);           // get dst_filename
+    sprintf(file_size_filename, "%s%s%s", buf_filename2, FILE_SIZE_PATH, argv[3]); // get file_size_filename to save file size of src file
+    printf("[erasure_coding_write_ecknet] The src_filename = %s\n", src_filename);
+    printf("[erasure_coding_write_ecknet] The dst_filename = %s\n", dst_filename);
+    printf("[erasure_coding_write_ecknet] The file_size_filename = %s\n", file_size_filename);
+
+    /* EC arguments */
+    if (EC_N % EC_X != 0)
+    {
+        printf("[erasure_coding_write_ecknet] EC_N%%EC_X!=0\n");
+        return EC_ERROR;
+    }
+    int chunk_size = CHUNK_SIZE * 1024 * 1024; // unit Byte
+    int sum_bwRatio = 0;
+    int block_size[EC_X];
+    for (i = 0; i < EC_X; i++)
+    {
+        sum_bwRatio += bwRatio[i];
+    }
+    int tmp_block_size = ((chunk_size / (EC_W / 8)) / ((EC_N / EC_X) * sum_bwRatio)) * (EC_W / 8);
+    int remain_block_size = ((chunk_size / (EC_W / 8)) % ((EC_N / EC_X) * sum_bwRatio)) * (EC_W / 8);
+    for (i = 0; i < EC_X; i++)
+    {
+        block_size[i] = tmp_block_size * bwRatio[i];
+    }
+
+    int buffer_size = EC_K * chunk_size;                       // stripe size
+    char *buffer = (char *)malloc(sizeof(char) * buffer_size); // buffer for EC stripe
+    if (buffer == NULL)
+    {
+        printf("[erasure_coding_write_ecknet] Failed to malloc buffer: buffer_size = %d Bytes\n", buffer_size);
+        return EC_ERROR;
+    }
+
+    char **data = (char **)malloc(sizeof(char *) * EC_K);         // data chunk
+    char **block = (char **)malloc(sizeof(char *) * EC_K * EC_N); // data block
+
+    /* Set pointers to point to file data */
+    int cur_size;
+    int k;
+    for (i = 0; i < EC_K; i++)
+    {
+        data[i] = buffer + (i * chunk_size);
+        for (j = 0; j < EC_N; j++)
+        {
+            if (j == 0)
+            {
+                block[i * EC_N + j] = data[i];
+                k = 0;
+                cur_size = remain_block_size + block_size[k];
+            }
+            else
+            {
+                block[i * EC_N + j] = data[i] + cur_size;
+                k++;
+                if (k == EC_X)
+                {
+                    k = 0;
+                }
+                cur_size += block_size[k];
+            }
+        }
+    }
+
+    /* Timing variables */
+    double totalsec = 0.0;
+
+    /* Open src_filename and error check */
+    src_fp = fopen(src_filename, "rb");
+    if (src_fp == NULL)
+    {
+        printf("[erasure_coding_write_ecknet] Failed to open file\n");
+        return EC_ERROR;
+    }
+
+    /* Determine original size of file */
+    stat(src_filename, &file_status);
+    file_size = file_status.st_size;
+
+    /* Number of reading */
+    if (file_size % buffer_size == 0)
+    {
+        reading = file_size / buffer_size;
+    }
+    else
+    {
+        reading = file_size / buffer_size + 1;
+    }
+
+    /* For Test */
+    if (reading != 1)
+    {
+        printf("[erasure_coding_write] File size is not %d MB, please use correct file\n", EC_K * CHUNK_SIZE);
+        return EC_ERROR;
+    }
+    int test_n = TEST_N;
+
+    current_reading = 1;
+
+    /* Wait chunk_ok response from coding datanode */
+    int client_fd; // client socket
+    tmp_return = server_initialize_network(&client_fd, EC_WRITE_PORT);
+    if (tmp_return == EC_ERROR)
+    {
+        printf("[erasure_coding_write_ecknet] Failed to server_initialize_network\n");
+        return EC_ERROR;
+    }
+
+    /* Begin EC */
+    while (current_reading <= reading)
+    {
+        /*One IO read file to buffer*/
+        io_flag = read_file_to_buffer(src_fp, buffer, buffer_size);
+        if (io_flag == EC_ERROR)
+        {
+            printf("[erasure_coding_write_ecknet] One IO read file to buffer: current reading = %d\n", current_reading);
+            fclose(src_fp);
+            return EC_ERROR;
+        }
+        /* create filename on stripe */
+        char dst_filename_stripe[MAX_PATH_LEN] = {0};
+        sprintf(dst_filename_stripe, "%s%d", dst_filename, current_reading);
+
+        /* Begin Test */
+        int test_times;
+        time_new_min = 99999.99999;
+        for (test_times = 1; test_times <= test_n; test_times++)
+        {
+            /* Send blocks to each datanode */
+            tmp_return = send_blocks_eck_datanodes_net(block, chunk_size, block_size, remain_block_size, dst_filename_stripe, client_fd);
+            if (tmp_return == EC_ERROR)
+            {
+                printf("[erasure_coding_write_ecknet] Failed to send chunks to datanode: current_reading = %d\n", current_reading);
+                fclose(src_fp);
+                return EC_ERROR;
+            }
+            totalsec += time_new;
+            printf("[erasure_coding_write_ecknet] Current test times = %d : EC write time (enc+net+disk) = %0.10f\n", test_times, time_new);
+        }
+        current_reading++;
+    }
+#if (TEST_LOG)
+    printf("[erasure_coding_write_ecknet] Average EC write time (enc+net+disk) = %0.10f\n", totalsec / reading / test_n);
+#endif
+    printf("[erasure_coding_write_ecknet] Min EC write time (enc+net+disk) = %0.10f\n", time_new_min);
+    fclose(src_fp);
+    shutdown(client_fd, SHUT_RDWR);
+    close(client_fd);
+
+    /* Write file size to file_size filename */
+    FILE *file_size_fp;
+    char file_size_buffer[MAX_PATH_LEN] = {0};
+    file_size_fp = fopen(file_size_filename, "wb");
+    if (file_size_fp == NULL)
+    {
+        printf("[erasure_coding_write_ecknet] Failed to open file\n");
+
+        return EC_ERROR;
+    }
+    sprintf(file_size_buffer, "%d", file_size);
+    if (fwrite(file_size_buffer, sizeof(char), sizeof(file_size_buffer), file_size_fp) != sizeof(file_size_buffer))
+    {
+        printf("[erasure_coding_write_ecknet] Failed to write file_size file\n");
+        fclose(file_size_fp);
+        return EC_ERROR;
+    }
+    fclose(file_size_fp);
+    return EC_OK;
+#else
+    printf("[erasure_coding_write_ecknet] Network module not opened, because ych_ec_test.h: SEND_DATANODE is 0\n");
+    return EC_OK;
+#endif
+}
+#endif
 
 static int erasure_coding_write_eck(int argc, char **argv)
 {
@@ -1810,7 +2199,7 @@ int main(int argc, char *argv[])
         return EC_OK;
     }
 
-    /* Cmd -w: erasure coding write */
+    /* Cmd -w: erasure coding write with regular method */
     else if (0 == strncmp(cmd, "-w", strlen("-w")))
     {
         if (erasure_coding_write(argc, argv) == EC_ERROR)
@@ -1818,7 +2207,7 @@ int main(int argc, char *argv[])
             printf("[main] Failed to write\n");
         }
     }
-    /* Cmd -wf: erasure coding write */
+    /* Cmd -kw: erasure coding write with new method */
     else if (0 == strncmp(cmd, "-kw", strlen("-kw")))
     {
         if (erasure_coding_write_eck(argc, argv) == EC_ERROR)
@@ -1826,6 +2215,17 @@ int main(int argc, char *argv[])
             printf("[main] Failed to write fast\n");
         }
     }
+
+#if (NET_BANDWIDTH_MODE)
+    /* Cmd -kwnet: erasure coding write with new method for different network bandwidth */
+    else if (0 == strncmp(cmd, "-netkw", strlen("-kw")))
+    {
+        if (erasure_coding_write_ecknet(argc, argv) == EC_ERROR)
+        {
+            printf("[main] Failed to write fast\n");
+        }
+    }
+#endif
     /* Cmd -r: erasure coding read*/
     else if (0 == strncmp(cmd, "-r", strlen("-r")))
     {

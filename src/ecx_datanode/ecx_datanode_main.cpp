@@ -125,6 +125,40 @@ void *send_one_request_datanode(void *arg)
         tmp_block = buffer_chunk + metadata->remain_block_size + (metadata->cur_block - 1) * metadata->block_size;
         tmp_block_size = metadata->block_size;
     }
+
+#if (NET_BANDWIDTH_MODE)
+    if (metadata->cur_block - 1 != 0)
+    {
+        int i;
+        int sum_block_size = 0;
+        int rounds_num = (metadata->cur_block - 1) / EC_X;
+        for (i = 0; i < EC_X; i++)
+        {
+            sum_block_size += metadata->net_block_size[i];
+        }
+        sum_block_size *= rounds_num;
+        int remain_block_num = (metadata->cur_block - 1) % EC_X;
+
+        if (remain_block_num != 0)
+        {
+            for (i = 0; i < remain_block_num; i++)
+            {
+                sum_block_size += metadata->net_block_size[i];
+            }
+        }
+        tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+    }
+
+    if (metadata->cur_block - 1 == 0)
+    {
+        tmp_block_size = metadata->net_block_size[0] + metadata->remain_block_size;
+    }
+    else
+    {
+        tmp_block_size = metadata->net_block_size[(metadata->cur_block - 1) % EC_X];
+    }
+#endif
+
     char *tmp_buffer_block = tmp_block;
     while (tmp_block_size > 0)
     {
@@ -353,6 +387,30 @@ void *handle_client_write_ecx(void *arg)
         tmp_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
     }
 
+#if (NET_BANDWIDTH_MODE)
+    if (metadata->cur_block != 0)
+    {
+        int sum_block_size = 0;
+        int rounds_num = metadata->cur_block / EC_X;
+        int i;
+        for (i = 0; i < EC_X; i++)
+        {
+            sum_block_size += metadata->net_block_size[i];
+        }
+        sum_block_size *= rounds_num;
+        int remain_block_num = metadata->cur_block % EC_X;
+
+        if (remain_block_num != 0)
+        {
+            for (i = 0; i < remain_block_num; i++)
+            {
+                sum_block_size += metadata->net_block_size[i];
+            }
+        }
+        tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+    }
+#endif
+
     /* recv ecx block data */
     int recv_size;
     int tmp_block_size = metadata->block_size;
@@ -488,6 +546,18 @@ void *handle_client_write_request(void *arg)
     {
         tmp_block_size = metadata->block_size;
     }
+
+#if (NET_BANDWIDTH_MODE)
+    if (metadata->cur_block - 1 == 0)
+    {
+        tmp_block_size = metadata->net_block_size[0] + metadata->remain_block_size;
+    }
+    else
+    {
+        tmp_block_size = metadata->net_block_size[(metadata->cur_block - 1) % EC_X];
+    }
+#endif
+
     if (send(client_fd, buffer_next_ecx_block, (size_t)tmp_block_size, 0) < 0)
     {
         printf("[handle_client_write_request] Failed to send ecx request block\n");
@@ -525,7 +595,7 @@ void *handle_client_write_new_enc(void *arg)
     {
         pthread_cond_wait((pthread_cond_t *)&cond_enc, &cond_enc_mutex);
     }
-    
+
     /* For encode and save */
     // if (metadata->cur_eck == 0) // If eck block from the first eck datanode
     if (cur_eck_enc == 0)
@@ -538,7 +608,7 @@ void *handle_client_write_new_enc(void *arg)
         }
     }
     char **coding_block = (char **)malloc(sizeof(char *) * EC_M); // Convenient to save intermediate coding block
-                                                                 
+
     /* Encoded */
     int matrix_value[EC_M];
     for (i = 0; i < EC_M; i++)
@@ -577,7 +647,6 @@ void *handle_client_write_new_enc(void *arg)
             }
             init[i] = 1;
         }
-       
     }
     free(buffer_block);
     free(coding_block);
@@ -611,7 +680,6 @@ void *handle_client_write_new_enc(void *arg)
             pthread_cond_wait((pthread_cond_t *)&cond_request_ecx, &cond_request_ecx_mutex);
         }
         /* Prepare */
-
         int next_next_ecx_datanode = (metadata->cur_block + 2) % EC_X;
         int next_ecx_datanode = (metadata->cur_block + 1) % EC_X;
         int local_ecx_datanode = metadata->cur_block % EC_X;
@@ -845,6 +913,29 @@ void *handle_client_write_new_enc(void *arg)
             {
                 tmp_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
             }
+
+#if (NET_BANDWIDTH_MODE)
+            if (metadata->cur_block != 0)
+            {
+                int sum_block_size = 0;
+                int rounds_num = metadata->cur_block / EC_X;
+                for (i = 0; i < EC_X; i++)
+                {
+                    sum_block_size += metadata->net_block_size[i];
+                }
+                sum_block_size *= rounds_num;
+                int remain_block_num = metadata->cur_block % EC_X;
+
+                if (remain_block_num != 0)
+                {
+                    for (i = 0; i < remain_block_num; i++)
+                    {
+                        sum_block_size += metadata->net_block_size[i];
+                    }
+                }
+                tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+            }
+#endif
             memcpy(tmp_block, tmp_block_multiply_m + local_ecx_datanode * (metadata->block_size + sizeof(long)), metadata->block_size);
             pthread_mutex_lock(&mutex_block_count);
             block_count++;
