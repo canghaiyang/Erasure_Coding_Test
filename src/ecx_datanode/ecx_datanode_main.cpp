@@ -749,7 +749,7 @@ void *handle_client_write_new_enc(void *arg)
                 tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_ECX_BASE_PORT + local_ecx_datanode, EC_K + i);
                 if (tmp_return == EC_ERROR)
                 {
-                    printf("[handle_client_write_new] Failed to initialize network\n");
+                    printf("[handle_client_write_new] Failed to initialize network: First send to ecm datanode\n");
                     return nullptr;
                 }
                 metadata->data = tmp_block_multiply_m + i * (metadata->block_size + sizeof(long));
@@ -788,7 +788,7 @@ void *handle_client_write_new_enc(void *arg)
                 tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_ECX_BASE_PORT + local_ecx_datanode, EC_K + i);
                 if (tmp_return == EC_ERROR)
                 {
-                    printf("[handle_client_write_new] Failed to initialize network\n");
+                    printf("[handle_client_write_new] Failed to initialize network: Send coding blocks to ecm datanode\n");
                     return nullptr;
                 }
                 metadata->data = tmp_block_multiply_m + i * (metadata->block_size + sizeof(long));
@@ -884,7 +884,7 @@ void *handle_client_write_new_enc(void *arg)
             tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, -1);
             if (tmp_return == EC_ERROR)
             {
-                printf("[handle_client_write_new] Failed to initialize network\n");
+                printf("[handle_client_write_new] Failed to initialize network: Send one chunk ok to client\n");
                 return nullptr;
             }
             /* Send chunk ok and recv response */
@@ -1359,8 +1359,8 @@ int main()
     cur_block_request_ecx = ecm - EC_K;
     cur_block_request = EC_N;
 
-    int ecm_array[EC_M];
-    for (i = 0; i < EC_M; i++)
+    int ecm_array[EC_X];
+    for (i = 0; i < EC_X; i++)
     {
         ecm_array[i] = i;
         /* create client_write_ecx thread to handle client_write_ecx */
