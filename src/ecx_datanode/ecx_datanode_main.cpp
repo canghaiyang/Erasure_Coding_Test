@@ -16,7 +16,6 @@
 #include "reed_sol.h"
 #include "galois.h"
 
-char *buffer_chunk = nullptr;
 char *block_multiply_m = nullptr;
 int init[EC_M];
 char *buffer_next_ecx_block = nullptr;
@@ -28,8 +27,9 @@ pthread_mutex_t mutex_block_count = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_buffer_next_ecx_block = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_block_multiply_m = PTHREAD_MUTEX_INITIALIZER;
 
-/* multiple threads control */
+pthread_mutex_t io_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* multiple threads control */
 pthread_mutex_t cond_net_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t cond_enc_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t cond_request_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -48,6 +48,55 @@ int cur_block_request_ecx;
 int cur_eck_net = 0;
 int cur_eck_enc = 0;
 int ecm;
+
+int replace_filename_suffix(char *filename, int suffix)
+{
+    // Find the position of the last '-' character
+    char *dash_pos = strrchr(filename, '_');
+    if (dash_pos == NULL)
+    {
+        printf("[replace_filename_suffix] Invalid filename\n");
+        return EC_ERROR;
+    }
+
+    // Find the position of the character to replace
+    int pos = dash_pos - filename + 1;
+
+    // Replace the number with the new number
+    char new_num_str[12];
+    sprintf(new_num_str, "%d", suffix);
+    strcpy(&filename[pos], new_num_str);
+
+    return EC_OK;
+}
+
+int get_local_ip_lastnum(int *lastnum_p)
+{
+    struct ifaddrs *ifAddrStruct = NULL;
+    struct ifaddrs *ifa = NULL;
+    void *tmpAddrPtr = NULL;
+
+    getifaddrs(&ifAddrStruct);
+    for (ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (ifa->ifa_addr->sa_family == AF_INET)
+        { // IPv4 address
+            tmpAddrPtr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+            char addressBuffer[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
+            if (strncmp(addressBuffer, IP_PREFIX, 10) == 0)
+            {
+                char *lastNumStr = strrchr(addressBuffer, '.') + 1;
+                *lastnum_p = atoi(lastNumStr);
+                return EC_OK;
+            }
+        }
+    }
+
+    if (ifAddrStruct != NULL)
+        freeifaddrs(ifAddrStruct);
+    return EC_ERROR;
+}
 
 int initialize_network(int *sockfd_p, int port, int ip_offset)
 {
@@ -85,6 +134,114 @@ int initialize_network(int *sockfd_p, int port, int ip_offset)
     return EC_OK;
 }
 
+void *handle_block_file_io(void *arg)
+{
+    metadata_t *metadata = (metadata_t *)arg;
+
+    if (block_count == -1) // If is the first round block
+    {
+        pthread_mutex_lock(&mutex_block_count);
+        block_count = 0;
+        pthread_mutex_unlock(&mutex_block_count);
+    }
+
+    /* Prepare-offset */
+    long int offset = metadata->chunk_size;
+
+    /* Prepare-filename */
+    int tmp_return = replace_filename_suffix(metadata->dst_filename_datanode, ecm + 1);
+    if (tmp_return == EC_ERROR)
+    {
+        printf("[handle_block_file_io] Failed to replace_filename_suffix\n");
+        return nullptr;
+    }
+
+    /* write block to disk */
+    FILE *chunk_fp = fopen(metadata->dst_filename_datanode, "r+");
+    if (chunk_fp == NULL)
+    {
+        chunk_fp = fopen(metadata->dst_filename_datanode, "w+");
+        if (chunk_fp == NULL)
+        {
+            printf("[handle_block_file_io] Failed to open dst_filename_datanode file\n");
+
+            return nullptr;
+        }
+    }
+    pthread_mutex_lock(&io_mutex);
+    fseek(chunk_fp, offset * sizeof(char), SEEK_SET);
+    if (fwrite(metadata->data, sizeof(char), (size_t)metadata->block_size, chunk_fp) != (size_t)metadata->block_size)
+    {
+        printf("[handle_block_file_io] Failed to write dst_filename_datanode file\n");
+        return nullptr;
+    }
+    fclose(chunk_fp);
+    pthread_mutex_unlock(&io_mutex);
+
+    pthread_mutex_lock(&mutex_block_count);
+    block_count++;
+    pthread_mutex_unlock(&mutex_block_count);
+
+    if (block_count == EC_N) // Only cur_block is last block
+    {
+        pthread_mutex_lock(&mutex_block_count);
+        block_count = -1;
+        pthread_mutex_unlock(&mutex_block_count);
+
+        /* Send one chunk ok to client */
+        tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, -1);
+        if (tmp_return == EC_ERROR)
+        {
+            printf("[handle_client_write_new] Failed to initialize network: Send one chunk ok to client\n");
+            return nullptr;
+        }
+        /* Send chunk ok and recv response */
+        int chunk_ok = 1;
+        if (send(metadata->sockfd, &chunk_ok, sizeof(chunk_ok), 0) < 0)
+        {
+            printf("[handle_client_write_new] Failed to send block metadata to datanode\n");
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+        int error_response = 0;
+        if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
+        {
+            printf("[handle_client_write_new] Failed to recv response \n");
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+        if (error_response == 0)
+        {
+            printf("[handle_client_write_new] Failed to recv response \n");
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+        close(metadata->sockfd);
+    }
+    free(metadata->data);
+    free(metadata);
+    return nullptr;
+}
+
+void *handle_file_io(void *arg)
+{
+    metadata_t *metadata = (metadata_t *)arg;
+    /* write chunk to disk */
+    FILE *chunk_fp = fopen(metadata->dst_filename_datanode, "wb");
+    if (chunk_fp == NULL)
+    {
+        printf("[handle_file_io] Failed to open dst_filename_datanode file\n");
+        return nullptr;
+    }
+    if (fwrite(metadata->data, sizeof(char), (size_t)metadata->chunk_size, chunk_fp) != (size_t)metadata->chunk_size)
+    {
+        printf("[handle_file_io] Failed to write dst_filename_datanode file\n");
+        return nullptr;
+    }
+    fclose(chunk_fp);
+    return nullptr;
+}
+
 void *send_one_request_datanode(void *arg)
 {
     metadata_t *metadata = (metadata_t *)arg;
@@ -112,18 +269,17 @@ void *send_one_request_datanode(void *arg)
     }
 
     /*Recv ecx block */
-    int recv_size;
-    int tmp_block_size;
-    char *tmp_block = nullptr;
+    int save_block_size;
+    long int save_offset;
     if (metadata->cur_block - 1 == 0)
     {
-        tmp_block = buffer_chunk;
-        tmp_block_size = metadata->block_size + metadata->remain_block_size;
+        save_offset = 0;
+        save_block_size = metadata->block_size + metadata->remain_block_size;
     }
     else
     {
-        tmp_block = buffer_chunk + metadata->remain_block_size + (metadata->cur_block - 1) * metadata->block_size;
-        tmp_block_size = metadata->block_size;
+        save_offset = metadata->remain_block_size + (metadata->cur_block - 1) * metadata->block_size;
+        save_block_size = metadata->block_size;
     }
 
 #if (NET_BANDWIDTH_MODE)
@@ -146,20 +302,23 @@ void *send_one_request_datanode(void *arg)
                 sum_block_size += metadata->net_block_size[i];
             }
         }
-        tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+        save_offset = metadata->remain_block_size + sum_block_size;
     }
 
     if (metadata->cur_block - 1 == 0)
     {
-        tmp_block_size = metadata->net_block_size[0] + metadata->remain_block_size;
+        save_block_size = metadata->net_block_size[0] + metadata->remain_block_size;
     }
     else
     {
-        tmp_block_size = metadata->net_block_size[(metadata->cur_block - 1) % EC_X];
+        save_block_size = metadata->net_block_size[(metadata->cur_block - 1) % EC_X];
     }
 #endif
 
-    char *tmp_buffer_block = tmp_block;
+    char *save_block = (char *)malloc(sizeof(char) * save_block_size);
+    char *tmp_buffer_block = save_block;
+    int tmp_block_size = save_block_size;
+    int recv_size;
     while (tmp_block_size > 0)
     {
         recv_size = recv(metadata->sockfd, tmp_buffer_block, tmp_block_size, 0);
@@ -181,6 +340,20 @@ void *send_one_request_datanode(void *arg)
         return nullptr;
     }
     // close(metadata->sockfd);
+
+    metadata_t *save_metadata = (metadata_t *)malloc(sizeof(metadata_t));
+    memcpy(save_metadata, metadata, sizeof(metadata_t));
+    save_metadata->data = save_block;
+    save_metadata->chunk_size = save_offset;
+    save_metadata->block_size = save_block_size;
+
+    pthread_t save_tid;
+    if (pthread_create(&save_tid, NULL, handle_block_file_io, (void *)save_metadata) != 0)
+    {
+        printf("[send_one_request_datanode] Failed to create IO thread\n");
+        return nullptr;
+    }
+
     return nullptr;
 }
 
@@ -234,55 +407,6 @@ void *send_one_block_datanode(void *arg)
     return nullptr;
 }
 
-int replace_filename_suffix(char *filename, int suffix)
-{
-    // Find the position of the last '-' character
-    char *dash_pos = strrchr(filename, '_');
-    if (dash_pos == NULL)
-    {
-        printf("[replace_filename_suffix] Invalid filename\n");
-        return EC_ERROR;
-    }
-
-    // Find the position of the character to replace
-    int pos = dash_pos - filename + 1;
-
-    // Replace the number with the new number
-    char new_num_str[12];
-    sprintf(new_num_str, "%d", suffix);
-    strcpy(&filename[pos], new_num_str);
-
-    return EC_OK;
-}
-
-int get_local_ip_lastnum(int *lastnum_p)
-{
-    struct ifaddrs *ifAddrStruct = NULL;
-    struct ifaddrs *ifa = NULL;
-    void *tmpAddrPtr = NULL;
-
-    getifaddrs(&ifAddrStruct);
-    for (ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next)
-    {
-        if (ifa->ifa_addr->sa_family == AF_INET)
-        { // IPv4 address
-            tmpAddrPtr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
-            char addressBuffer[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
-            if (strncmp(addressBuffer, IP_PREFIX, 10) == 0)
-            {
-                char *lastNumStr = strrchr(addressBuffer, '.') + 1;
-                *lastnum_p = atoi(lastNumStr);
-                return EC_OK;
-            }
-        }
-    }
-
-    if (ifAddrStruct != NULL)
-        freeifaddrs(ifAddrStruct);
-    return EC_ERROR;
-}
-
 int server_initialize_network(int *server_fd_p, int port)
 {
     int server_fd;
@@ -317,29 +441,9 @@ int server_initialize_network(int *server_fd_p, int port)
     return EC_OK;
 }
 
-void *handle_file_io(void *arg)
-{
-    metadata_t *metadata = (metadata_t *)arg;
-    /* write chunk to disk */
-    FILE *chunk_fp = fopen(metadata->dst_filename_datanode, "wb");
-    if (chunk_fp == NULL)
-    {
-        printf("[handle_file_io] Failed to open dst_filename_datanode file\n");
-        return nullptr;
-    }
-    if (fwrite(metadata->data, sizeof(char), (size_t)metadata->chunk_size, chunk_fp) != (size_t)metadata->chunk_size)
-    {
-        printf("[handle_file_io] Failed to write dst_filename_datanode file\n");
-        return nullptr;
-    }
-    fclose(chunk_fp);
-    return nullptr;
-}
-
 void *handle_client_write_ecx(void *arg)
 {
     int client_fd = *((int *)arg);
-    char *tmp_block = nullptr;
     int tmp_return;
     metadata_t *metadata = (metadata_t *)malloc(sizeof(metadata_t));
     int error_response = 0;
@@ -370,21 +474,16 @@ void *handle_client_write_ecx(void *arg)
         return nullptr;
     }
 
-    /* repare for recv ecx block data */
-    if (block_count == -1) // If is the first round block
-    {
-        pthread_mutex_lock(&mutex_block_count);
-        block_count = 0;
-        pthread_mutex_unlock(&mutex_block_count);
-        buffer_chunk = (char *)malloc(sizeof(char) * metadata->chunk_size);
-    }
+    char *save_block = (char *)malloc(sizeof(char) * metadata->block_size);
+    long int save_offset;
+
     if (metadata->cur_block == 0)
     {
-        tmp_block = buffer_chunk;
+        save_offset = 0;
     }
     else
     {
-        tmp_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
+        save_offset = metadata->remain_block_size + metadata->cur_block * metadata->block_size;
     }
 
 #if (NET_BANDWIDTH_MODE)
@@ -407,14 +506,14 @@ void *handle_client_write_ecx(void *arg)
                 sum_block_size += metadata->net_block_size[i];
             }
         }
-        tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+        save_offset = metadata->remain_block_size + sum_block_size;
     }
 #endif
 
     /* recv ecx block data */
     int recv_size;
     int tmp_block_size = metadata->block_size;
-    char *tmp_buffer_block = tmp_block;
+    char *tmp_buffer_block = save_block;
     while (tmp_block_size > 0)
     {
         recv_size = recv(client_fd, tmp_buffer_block, tmp_block_size, 0);
@@ -432,67 +531,17 @@ void *handle_client_write_ecx(void *arg)
         printf("[handle_client_write_ecx] Failed to send block data response to ecx datanode\n");
         return nullptr;
     }
-    pthread_mutex_lock(&mutex_block_count);
-    block_count++;
-    pthread_mutex_unlock(&mutex_block_count);
 
-    if (block_count == EC_N)
+    metadata_t *save_metadata = (metadata_t *)malloc(sizeof(metadata_t));
+    memcpy(save_metadata, metadata, sizeof(metadata_t));
+    save_metadata->data = save_block;
+    save_metadata->chunk_size = save_offset;
+
+    pthread_t save_tid;
+    if (pthread_create(&save_tid, NULL, handle_block_file_io, (void *)save_metadata) != 0)
     {
-        /* create thread to handle file IO */
-        tmp_return = replace_filename_suffix(metadata->dst_filename_datanode, ecm + 1);
-        if (tmp_return == EC_ERROR)
-        {
-            printf("[handle_client_write_ecx] Failed to replace_filename_suffix\n");
-            return nullptr;
-        }
-        metadata->data = buffer_chunk;
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, handle_file_io, (void *)metadata) != 0)
-        {
-            printf("[handle_client_write_ecx] Failed to create IO thread\n");
-            return nullptr;
-        }
-        /* Wait until thread end */
-        if (pthread_join(tid, nullptr) != 0)
-        {
-            printf("[handle_client_write_ecx] Failed to join thread\n");
-            return nullptr;
-        }
-        free(buffer_chunk);
-        pthread_mutex_lock(&mutex_block_count);
-        block_count = -1;
-        pthread_mutex_unlock(&mutex_block_count);
-
-        /* Send one chunk ok to client */
-        /* Initialize thread metadata */
-        tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, -1);
-        if (tmp_return == EC_ERROR)
-        {
-            printf("[handle_client_write_ecx] Failed to initialize network\n");
-            return nullptr;
-        }
-        /* Send chunk ok and recv response */
-        int chunk_ok = 1;
-        if (send(metadata->sockfd, &chunk_ok, sizeof(chunk_ok), 0) < 0)
-        {
-            printf("[handle_client_write_ecx] Failed to send block metadata to datanode\n");
-            metadata->error_flag = EC_ERROR;
-            return nullptr;
-        }
-        int error_response = 0;
-        if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
-        {
-            printf("[handle_client_write_ecx] Failed to recv block metadata response from datanode\n");
-            metadata->error_flag = EC_ERROR;
-            return nullptr;
-        }
-        if (error_response == 0)
-        {
-            printf("[handle_client_write_ecx] Failed to recv block metadata response from datanode\n");
-            metadata->error_flag = EC_ERROR;
-            return nullptr;
-        }
-        close(metadata->sockfd);
+        printf("[send_one_request_datanode] Failed to create IO thread\n");
+        return nullptr;
     }
 
     close(client_fd);
@@ -656,6 +705,7 @@ void *handle_client_write_new_enc(void *arg)
         tmp_block_multiply_m = (char *)malloc(sizeof(char) * (metadata->block_size + sizeof(long)) * EC_M); // Avoid being used by other threads before the coding blocks are transmitted completely
         memcpy(tmp_block_multiply_m, block_multiply_m, (metadata->block_size + sizeof(long)) * EC_M);
         free(block_multiply_m);
+
         pthread_mutex_unlock(&mutex_block_multiply_m);
     }
 
@@ -671,27 +721,72 @@ void *handle_client_write_new_enc(void *arg)
 
     pthread_cond_broadcast(&cond_enc);
     pthread_mutex_unlock(&cond_enc_mutex);
+    
     /* If is last cur eck block */
     if (metadata->cur_eck == EC_K - 1)
     {
-        pthread_mutex_lock(&cond_request_ecx_mutex);
-        while (metadata->cur_block != cur_block_request_ecx)
-        {
-            pthread_cond_wait((pthread_cond_t *)&cond_request_ecx, &cond_request_ecx_mutex);
-        }
         /* Prepare */
         int next_next_ecx_datanode = (metadata->cur_block + 2) % EC_X;
         int next_ecx_datanode = (metadata->cur_block + 1) % EC_X;
         int local_ecx_datanode = metadata->cur_block % EC_X;
         int prev_ecx_datanode = (metadata->cur_block - 1 + EC_X) % EC_X;
-        if (block_count == -1) // If is the first round block
+
+        /* Save coding block */
+        if (local_ecx_datanode < EC_M)
         {
-            pthread_mutex_lock(&mutex_block_count);
-            block_count = 0;
-            pthread_mutex_unlock(&mutex_block_count);
-            buffer_chunk = (char *)malloc(sizeof(char) * metadata->chunk_size);
+            char *save_block = (char *)malloc(sizeof(char) * metadata->block_size);
+            long int save_offset;
+            if (metadata->cur_block == 0)
+            {
+                save_offset = 0;
+            }
+            else
+            {
+                save_offset = metadata->remain_block_size + metadata->cur_block * metadata->block_size;
+            }
+
+#if (NET_BANDWIDTH_MODE)
+            if (metadata->cur_block != 0)
+            {
+                int sum_block_size = 0;
+                int rounds_num = metadata->cur_block / EC_X;
+                for (i = 0; i < EC_X; i++)
+                {
+                    sum_block_size += metadata->net_block_size[i];
+                }
+                sum_block_size *= rounds_num;
+                int remain_block_num = metadata->cur_block % EC_X;
+
+                if (remain_block_num != 0)
+                {
+                    for (i = 0; i < remain_block_num; i++)
+                    {
+                        sum_block_size += metadata->net_block_size[i];
+                    }
+                }
+                save_offset = metadata->remain_block_size + sum_block_size;
+            }
+#endif
+            memcpy(save_block, tmp_block_multiply_m + local_ecx_datanode * (metadata->block_size + sizeof(long)), metadata->block_size);
+
+            metadata_t *save_metadata = (metadata_t *)malloc(sizeof(metadata_t));
+            memcpy(save_metadata, metadata, sizeof(metadata_t));
+            save_metadata->data = save_block;
+            save_metadata->chunk_size = save_offset;
+
+            pthread_t save_tid;
+            if (pthread_create(&save_tid, NULL, handle_block_file_io, (void *)save_metadata) != 0)
+            {
+                printf("[handle_client_write_new] Failed to create IO thread\n");
+                return nullptr;
+            }
         }
 
+        pthread_mutex_lock(&cond_request_ecx_mutex);
+        while (metadata->cur_block != cur_block_request_ecx)
+        {
+            pthread_cond_wait((pthread_cond_t *)&cond_request_ecx, &cond_request_ecx_mutex);
+        }
 #if (EC_X > 1)
 #if (EC_X <= EC_M)
         /* Save for next ecx datanode */
@@ -709,19 +804,19 @@ void *handle_client_write_new_enc(void *arg)
 
         /* Send coding blocks request to previous ecx datanode */
         pthread_t tid_request;
-        metadata_t *tmp_metadata;
+        metadata_t *request_metadata;
         if (metadata->cur_block != 0 && local_ecx_datanode < EC_M) // No the first block and is coding datanode
         {
-            tmp_metadata = (metadata_t *)malloc(sizeof(metadata_t));
-            memcpy(tmp_metadata, metadata, sizeof(metadata_t));
-            int tmp_return = initialize_network(&tmp_metadata->sockfd, EC_WRITE_REQUEST_BASE_PORT + (ecm - EC_K - 1 + EC_X) % EC_X, EC_K + prev_ecx_datanode);
+            request_metadata = (metadata_t *)malloc(sizeof(metadata_t));
+            memcpy(request_metadata, metadata, sizeof(metadata_t));
+            int tmp_return = initialize_network(&request_metadata->sockfd, EC_WRITE_REQUEST_BASE_PORT + (ecm - EC_K - 1 + EC_X) % EC_X, EC_K + prev_ecx_datanode);
             if (tmp_return == EC_ERROR)
             {
                 printf("[send_one_request_datanode] Failed to initialize network\n");
                 return nullptr;
             }
-            tmp_metadata->cur_eck = -2; // ecx block request
-            if (pthread_create(&tid_request, NULL, send_one_request_datanode, (void *)tmp_metadata) != 0)
+            request_metadata->cur_eck = -2; // ecx block request
+            if (pthread_create(&tid_request, NULL, send_one_request_datanode, (void *)request_metadata) != 0)
             {
                 printf("[handle_client_write_new] Failed to create send one block thread\n");
                 return nullptr;
@@ -889,118 +984,15 @@ void *handle_client_write_new_enc(void *arg)
                 printf("[handle_client_write_new] Failed to join thread\n");
                 return nullptr;
             }
-            pthread_mutex_lock(&mutex_block_count);
-            block_count++;
-            pthread_mutex_unlock(&mutex_block_count);
-            close(tmp_metadata->sockfd);
-            free(tmp_metadata);
+            close(request_metadata->sockfd);
+            free(request_metadata);
         }
 #endif
-
         cur_block_request_ecx = cur_block_request_ecx + EC_X >= EC_N ? ecm - EC_K : cur_block_request_ecx + EC_X;
         pthread_cond_broadcast(&cond_request_ecx);
         pthread_mutex_unlock(&cond_request_ecx_mutex);
 
-        /* Save coding block */
-        char *tmp_block = nullptr;
-        if (local_ecx_datanode < EC_M)
-        {
-            if (metadata->cur_block == 0)
-            {
-                tmp_block = buffer_chunk;
-            }
-            else
-            {
-                tmp_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
-            }
-
-#if (NET_BANDWIDTH_MODE)
-            if (metadata->cur_block != 0)
-            {
-                int sum_block_size = 0;
-                int rounds_num = metadata->cur_block / EC_X;
-                for (i = 0; i < EC_X; i++)
-                {
-                    sum_block_size += metadata->net_block_size[i];
-                }
-                sum_block_size *= rounds_num;
-                int remain_block_num = metadata->cur_block % EC_X;
-
-                if (remain_block_num != 0)
-                {
-                    for (i = 0; i < remain_block_num; i++)
-                    {
-                        sum_block_size += metadata->net_block_size[i];
-                    }
-                }
-                tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
-            }
-#endif
-            memcpy(tmp_block, tmp_block_multiply_m + local_ecx_datanode * (metadata->block_size + sizeof(long)), metadata->block_size);
-            pthread_mutex_lock(&mutex_block_count);
-            block_count++;
-            pthread_mutex_unlock(&mutex_block_count);
-        }
         free(tmp_block_multiply_m);
-
-        if (block_count == EC_N) // Only cur_block is last block
-        {
-            /* create thread to handle file IO */
-            pthread_t tid;
-            tmp_return = replace_filename_suffix(metadata->dst_filename_datanode, ecm + 1);
-            if (tmp_return == EC_ERROR)
-            {
-                printf("[handle_client_write_new] Failed to replace_filename_suffix\n");
-                return nullptr;
-            }
-            metadata->data = buffer_chunk;
-            if (pthread_create(&tid, NULL, handle_file_io, (void *)metadata) != 0)
-            {
-                printf("[handle_client_write_new] Failed to create IO thread\n");
-                return nullptr;
-            }
-            /* Wait until thread end */
-            if (pthread_join(tid, nullptr) != 0)
-            {
-                printf("[handle_client_write_new] Failed to join thread\n");
-                return nullptr;
-            }
-            free(buffer_chunk);
-            pthread_mutex_lock(&mutex_block_count);
-            block_count = -1;
-            pthread_mutex_unlock(&mutex_block_count);
-
-            /* Send one chunk ok to client */
-            /* Initialize thread metadata */
-            tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, -1);
-            if (tmp_return == EC_ERROR)
-            {
-                printf("[handle_client_write_new] Failed to initialize network: Send one chunk ok to client\n");
-                return nullptr;
-            }
-            /* Send chunk ok and recv response */
-            int chunk_ok = 1;
-            if (send(metadata->sockfd, &chunk_ok, sizeof(chunk_ok), 0) < 0)
-            {
-                printf("[handle_client_write_new] Failed to send block metadata to datanode\n");
-                metadata->error_flag = EC_ERROR;
-                return nullptr;
-            }
-            int error_response = 0;
-            if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
-            {
-                printf("[handle_client_write_new] Failed to recv response \n");
-                metadata->error_flag = EC_ERROR;
-                return nullptr;
-            }
-            if (error_response == 0)
-            {
-                printf("[handle_client_write_new] Failed to recv response \n");
-                metadata->error_flag = EC_ERROR;
-                return nullptr;
-            }
-            close(metadata->sockfd);
-        }
     }
     free(metadata);
     return nullptr;

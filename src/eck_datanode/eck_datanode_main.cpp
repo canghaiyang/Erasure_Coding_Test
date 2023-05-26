@@ -16,11 +16,13 @@
 #include "reed_sol.h"
 #include "galois.h"
 
-char *buffer_chunk = nullptr;
-
 int cur_block = 0;
 pthread_mutex_t cond_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+
+int block_count = -1;
+pthread_mutex_t mutex_block_count = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t io_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int eck;
 
@@ -175,6 +177,87 @@ int server_initialize_network(int *server_fd_p, int port)
     return EC_OK;
 }
 
+void *handle_block_file_io(void *arg)
+{
+    metadata_t *metadata = (metadata_t *)arg;
+
+    if (block_count == -1) // If is the first round block
+    {
+        pthread_mutex_lock(&mutex_block_count);
+        block_count = 0;
+        pthread_mutex_unlock(&mutex_block_count);
+    }
+
+    /* Prepare-offset */
+    long int offset = metadata->chunk_size;
+
+    /* write block to disk */
+    FILE *chunk_fp = fopen(metadata->dst_filename_datanode, "r+");
+    if (chunk_fp == NULL)
+    {
+        chunk_fp = fopen(metadata->dst_filename_datanode, "w+");
+        if (chunk_fp == NULL)
+        {
+            printf("[handle_block_file_io] Failed to open dst_filename_datanode file\n");
+
+            return nullptr;
+        }
+    }
+    pthread_mutex_lock(&io_mutex);
+    fseek(chunk_fp, offset * sizeof(char), SEEK_SET);
+    if (fwrite(metadata->data, sizeof(char), (size_t)metadata->block_size, chunk_fp) != (size_t)metadata->block_size)
+    {
+        printf("[handle_block_file_io] Failed to write dst_filename_datanode file\n");
+        return nullptr;
+    }
+    fclose(chunk_fp);
+    pthread_mutex_unlock(&io_mutex);
+
+    pthread_mutex_lock(&mutex_block_count);
+    block_count++;
+    pthread_mutex_unlock(&mutex_block_count);
+
+    if (block_count == EC_N) // Only cur_block is last block
+    {
+        pthread_mutex_lock(&mutex_block_count);
+        block_count = -1;
+        pthread_mutex_unlock(&mutex_block_count);
+
+        /* Send one chunk ok to client */
+        int tmp_return = initialize_network(&metadata->sockfd, EC_WRITE_PORT, -1);
+        if (tmp_return == EC_ERROR)
+        {
+            printf("[handle_client_write_new] Failed to initialize network: Send one chunk ok to client\n");
+            return nullptr;
+        }
+        /* Send chunk ok and recv response */
+        int chunk_ok = 1;
+        if (send(metadata->sockfd, &chunk_ok, sizeof(chunk_ok), 0) < 0)
+        {
+            printf("[handle_client_write_new] Failed to send block metadata to datanode\n");
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+        int error_response = 0;
+        if (recv(metadata->sockfd, &error_response, sizeof(error_response), 0) < 0)
+        {
+            printf("[handle_client_write_new] Failed to recv response \n");
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+        if (error_response == 0)
+        {
+            printf("[handle_client_write_new] Failed to recv response \n");
+            metadata->error_flag = EC_ERROR;
+            return nullptr;
+        }
+        close(metadata->sockfd);
+    }
+    free(metadata->data);
+    free(metadata);
+    return nullptr;
+}
+
 void *handle_file_io(void *arg)
 {
     metadata_t *metadata = (metadata_t *)arg;
@@ -240,40 +323,6 @@ void *handle_client_write_new_ecx(void *arg)
     }
 
     /* Send ecx data */
-    char *buffer_block = nullptr;
-    if (metadata->cur_block == 0)
-    {
-        buffer_block = buffer_chunk;
-    }
-    else
-    {
-        buffer_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
-    }
-
-#if (NET_BANDWIDTH_MODE)
-    int i;
-    if (metadata->cur_block != 0)
-    {
-        int sum_block_size = 0;
-        int rounds_num = metadata->cur_block / EC_X;
-        for (i = 0; i < EC_X; i++)
-        {
-            sum_block_size += metadata->net_block_size[i];
-        }
-        sum_block_size *= rounds_num;
-        int remain_block_num = metadata->cur_block % EC_X;
-
-        if (remain_block_num != 0)
-        {
-            for (i = 0; i < remain_block_num; i++)
-            {
-                sum_block_size += metadata->net_block_size[i];
-            }
-        }
-        buffer_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
-    }
-#endif
-    metadata->data = buffer_block;
     if (send(metadata->sockfd, metadata->data, metadata->block_size, 0) < 0)
     {
         printf("[send_one_block_datanode] Failed to send block data to datanode\n");
@@ -301,23 +350,18 @@ void *handle_client_write_new_ecx(void *arg)
     pthread_cond_broadcast(&cond);
     pthread_mutex_unlock(&cond_mutex);
 
-    /* If cur_block is last block ,create thread to handle file IO */
+    /* If cur_block is last block */
     if (metadata->cur_block == EC_N - 1)
     {
-        pthread_t tid;
-        metadata->data = buffer_chunk;
-        if (pthread_create(&tid, NULL, handle_file_io, (void *)metadata) != 0)
-        {
-            printf("[handle_client_write_new] Failed to create IO thread\n");
-            free(metadata->data);
-            free(metadata);
-            return nullptr;
-        }
         for (int i = 0; i < EC_X; i++)
         {
             close(sockfd_array[i]);
         }
     }
+    free(metadata->data);
+    free(metadata);
+    return nullptr;
+
 }
 
 void *handle_client_write_new(void *arg)
@@ -367,15 +411,16 @@ void *handle_client_write_new(void *arg)
             printf("[handle_client_write_new] cur_block = %d\n", metadata->cur_block);
 #endif
             /* recv client datda */
-            char *buffer_block = nullptr;
+            char *save_block = (char *)malloc(sizeof(char) * metadata->block_size);
+            char *send_block = (char *)malloc(sizeof(char) * metadata->block_size);
+            long int save_offset;
             if (metadata->cur_block == 0)
             {
-                buffer_chunk = (char *)malloc(sizeof(char) * metadata->chunk_size);
-                buffer_block = buffer_chunk;
+                save_offset = 0;
             }
             else
             {
-                buffer_block = buffer_chunk + metadata->remain_block_size + metadata->cur_block * metadata->block_size;
+                save_offset = metadata->remain_block_size + metadata->cur_block * metadata->block_size;
             }
 #if (NET_BANDWIDTH_MODE)
             if (metadata->cur_block != 0)
@@ -396,13 +441,13 @@ void *handle_client_write_new(void *arg)
                         sum_block_size += metadata->net_block_size[i];
                     }
                 }
-                buffer_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+                save_offset = metadata->remain_block_size + sum_block_size;
             }
 #endif
 
             int recv_size;
             int tmp_block_size = metadata->block_size;
-            char *tmp_buffer_block = buffer_block;
+            char *tmp_buffer_block = save_block;
             while (tmp_block_size > 0)
             {
                 recv_size = recv(client_fd, tmp_buffer_block, tmp_block_size, 0);
@@ -411,8 +456,6 @@ void *handle_client_write_new(void *arg)
                     printf("[handle_client_write_new] Failed to recv block data\n");
                     perror("recv"); // print error information
                     free(metadata);
-                    free(buffer_chunk);
-                    free(buffer_block);
                     close(client_fd);
                     return nullptr;
                 }
@@ -424,14 +467,30 @@ void *handle_client_write_new(void *arg)
             {
                 printf("[handle_client_write_new] Failed to send block data response to client\n");
                 free(metadata);
-                free(buffer_chunk);
-                free(buffer_block);
                 close(client_fd);
                 return nullptr;
             }
 
+            memcpy(send_block, save_block, metadata->block_size);
+
+            metadata_t *save_metadata = (metadata_t *)malloc(sizeof(metadata_t));
+            memcpy(save_metadata, metadata, sizeof(metadata_t));
+            save_metadata->data = save_block;
+            save_metadata->chunk_size = save_offset;
+
+            pthread_t save_tid;
+            if (pthread_create(&save_tid, NULL, handle_block_file_io, (void *)save_metadata) != 0)
+            {
+                printf("[handle_client_write_new] Failed to create IO thread\n");
+                return nullptr;
+            }
+
+            metadata_t *send_metadata = (metadata_t *)malloc(sizeof(metadata_t));
+            memcpy(send_metadata, metadata, sizeof(metadata_t));
+            send_metadata->data = send_block;
+
             pthread_t tid_ecx;
-            if (pthread_create(&tid_ecx, NULL, handle_client_write_new_ecx, (void *)metadata) != 0)
+            if (pthread_create(&tid_ecx, NULL, handle_client_write_new_ecx, (void *)send_metadata) != 0)
             {
                 printf("[handle_client_write_new] Failed to create ecx thread\n");
                 free(metadata->data);
@@ -439,11 +498,7 @@ void *handle_client_write_new(void *arg)
                 close(client_fd);
                 return nullptr;
             }
-            if (pthread_detach(tid_ecx) != 0)
-            {
-                printf("Failed to detach thread.\n");
-                return nullptr;
-            }
+
             if (metadata->cur_block == EC_N - 1)
             {
                 break;
@@ -454,6 +509,7 @@ void *handle_client_write_new(void *arg)
             printf("[handle_client_write_new] error recv: CUR_ECK = %d \n", metadata->cur_eck);
             return nullptr;
         }
+        free(metadata);
     }
 
     close(client_fd);
@@ -463,7 +519,7 @@ void *handle_client_write_new(void *arg)
 void *handle_client_write(void *arg)
 {
     int client_fd = *((int *)arg);
-
+    char *buffer_chunk;
     metadata_t *metadata = (metadata_t *)malloc(sizeof(metadata_t));
     int error_response = 0;
 

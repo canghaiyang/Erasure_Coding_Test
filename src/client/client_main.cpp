@@ -506,7 +506,7 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
     }
 
     int datanode_fd; // datanode socket
-    int chunk_count = EC_M;
+    int chunk_count = EC_M + EC_K;
     struct sockaddr_in datanode_addr;
     socklen_t datanode_addr_len = sizeof(datanode_addr);
     pthread_t tid_client;
@@ -528,7 +528,7 @@ int send_blocks_eck_datanodes(char **block, int chunk_size, int block_size, int 
             return EC_ERROR;
         }
         /* Wait until thread end */
-        if (pthread_join(tid[cur], nullptr) != 0)
+        if (pthread_join(tid_client, nullptr) != 0)
         {
             printf("[send_blocks_eck_datanodes] Failed to join thread\n");
             return EC_ERROR;
