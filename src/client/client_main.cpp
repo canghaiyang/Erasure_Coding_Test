@@ -1832,11 +1832,15 @@ static int erasure_coding_write(int argc, char **argv)
                 tsec /= 1000000.0;
                 tsec += t_io2.tv_sec;
                 tsec -= t_io1.tv_sec;
+
+#if (DISK_WRITE_TEST)
+                tsec = tsec * DISK_DELAY_MUL;
+#endif
                 if (tsec > max_tsec)
                 {
                     max_tsec = tsec;
                 }
-                printf("[erasure_coding_write] The %dth chunk: write IO time = %0.10f\n", i + 1, tsec);
+                printf("[erasure_coding_write] The %dth chunk: write IO time = %0.10f\n", i + 1, max_tsec);
             }
 #if (TEST_LOG)
             printf("[erasure_coding_write] Max write disk IO time = %0.10f\n", max_tsec);

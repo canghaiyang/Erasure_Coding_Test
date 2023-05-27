@@ -9,10 +9,16 @@
 #define EC_X 3       // x number of encoded nodes
 #define EC_N 3       // a chunk is divided into N blocks, larger than or equal to EC_X
 
-#define NET_BANDWIDTH_MODE 1 // 1, for differnet network bandwith; 0, just regular
+#define NET_BANDWIDTH_MODE 0 // 1, for differnet network bandwith; 0, just regular
+#define DISK_WRITE_TEST 1    // 1, Open disk write delay: Delay multiple is DISK_DELAY_MUL ; 0, just regular
+
 #define SEND_DATANODE 1      // 1, send chunks to datanode; 0, just locally encode
 #define SEND_METHOD 1        // 1, send in serial; 0,send in parallel
 #define RECV_METHOD 1        // 1, recv in serial; 0,recv in parallel
+
+#if (DISK_WRITE_TEST)
+#define DISK_DELAY_MUL 10
+#endif
 
 #define WRITE_PATH "test_file/write/"                   // src_file and dst_file saved path
 #define READ_PATH "test_file/read/"                     // src_file and dst_file saved path
@@ -34,10 +40,10 @@
 
 typedef struct metadata_s // chunk metadata and data
 {
-    int sockfd;     // network socket fd
-    long int chunk_size; // chunk size or offset
-    int block_size; // chunk size
-    int remain_block_size;//remain_block_size 
+    int sockfd;            // network socket fd
+    long int chunk_size;   // chunk size or offset
+    int block_size;        // chunk size
+    int remain_block_size; // remain_block_size
     int cur_block;
     int cur_eck;
     char *data;                               // chunk data or block data

@@ -203,6 +203,14 @@ void *handle_block_file_io(void *arg)
             return nullptr;
         }
     }
+
+#if (DISK_WRITE_TEST)
+    struct timeval t_io1, t_io2;
+    struct timezone tz;
+    double tsec;
+    gettimeofday(&t_io1, &tz);
+#endif
+
     pthread_mutex_lock(&io_mutex);
     fseek(chunk_fp, offset * sizeof(char), SEEK_SET);
     if (fwrite(metadata->data, sizeof(char), (size_t)metadata->block_size, chunk_fp) != (size_t)metadata->block_size)
@@ -210,8 +218,25 @@ void *handle_block_file_io(void *arg)
         printf("[handle_block_file_io] Failed to write dst_filename_datanode file\n");
         return nullptr;
     }
+    fflush(chunk_fp);
+    fsync(fileno(chunk_fp));
     fclose(chunk_fp);
     pthread_mutex_unlock(&io_mutex);
+
+#if (DISK_WRITE_TEST)
+    gettimeofday(&t_io2, &tz);
+    tsec = 0.0;
+    tsec += t_io2.tv_usec;
+    tsec -= t_io1.tv_usec;
+    tsec /= 1000000.0;
+    tsec += t_io2.tv_sec;
+    tsec -= t_io1.tv_sec;
+    int sleep_time = (int)(tsec * 1000000 * (DISK_DELAY_MUL - 1));
+#if (TEST_LOG)
+    printf("io time = %0.10f, sleep_time = %d\n", tsec, sleep_time);
+#endif
+    usleep(sleep_time);
+#endif
 
     pthread_mutex_lock(&mutex_block_count);
     block_count++;
@@ -279,6 +304,8 @@ void *handle_file_io(void *arg)
         free(metadata);
         return nullptr;
     }
+    fflush(chunk_fp);
+    fsync(fileno(chunk_fp));
     fclose(chunk_fp);
     free(metadata->data);
     free(metadata);
@@ -361,7 +388,6 @@ void *handle_client_write_new_ecx(void *arg)
     free(metadata->data);
     free(metadata);
     return nullptr;
-
 }
 
 void *handle_client_write_new(void *arg)
