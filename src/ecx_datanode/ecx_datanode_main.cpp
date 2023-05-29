@@ -159,6 +159,39 @@ void *send_one_request_datanode(void *arg)
     }
 #endif
 
+#if (ENCODE_ISOMERISM_MODE)
+    if (metadata->cur_block - 1 != 0)
+    {
+        int i;
+        int sum_block_size = 0;
+        int rounds_num = (metadata->cur_block - 1) / EC_X;
+        for (i = 0; i < EC_X; i++)
+        {
+            sum_block_size += metadata->enc_block_size[i];
+        }
+        sum_block_size *= rounds_num;
+        int remain_block_num = (metadata->cur_block - 1) % EC_X;
+
+        if (remain_block_num != 0)
+        {
+            for (i = 0; i < remain_block_num; i++)
+            {
+                sum_block_size += metadata->enc_block_size[i];
+            }
+        }
+        tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+    }
+
+    if (metadata->cur_block - 1 == 0)
+    {
+        tmp_block_size = metadata->enc_block_size[0] + metadata->remain_block_size;
+    }
+    else
+    {
+        tmp_block_size = metadata->enc_block_size[(metadata->cur_block - 1) % EC_X];
+    }
+#endif
+
     char *tmp_buffer_block = tmp_block;
     while (tmp_block_size > 0)
     {
@@ -411,6 +444,30 @@ void *handle_client_write_ecx(void *arg)
     }
 #endif
 
+#if (ENCODE_ISOMERISM_MODE)
+    if (metadata->cur_block != 0)
+    {
+        int sum_block_size = 0;
+        int rounds_num = metadata->cur_block / EC_X;
+        int i;
+        for (i = 0; i < EC_X; i++)
+        {
+            sum_block_size += metadata->enc_block_size[i];
+        }
+        sum_block_size *= rounds_num;
+        int remain_block_num = metadata->cur_block % EC_X;
+
+        if (remain_block_num != 0)
+        {
+            for (i = 0; i < remain_block_num; i++)
+            {
+                sum_block_size += metadata->enc_block_size[i];
+            }
+        }
+        tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+    }
+#endif
+
     /* recv ecx block data */
     int recv_size;
     int tmp_block_size = metadata->block_size;
@@ -558,6 +615,17 @@ void *handle_client_write_request(void *arg)
     }
 #endif
 
+#if (ENCODE_ISOMERISM_MODE)
+    if (metadata->cur_block - 1 == 0)
+    {
+        tmp_block_size = metadata->enc_block_size[0] + metadata->remain_block_size;
+    }
+    else
+    {
+        tmp_block_size = metadata->enc_block_size[(metadata->cur_block - 1) % EC_X];
+    }
+#endif
+
     if (send(client_fd, buffer_next_ecx_block, (size_t)tmp_block_size, 0) < 0)
     {
         printf("[handle_client_write_request] Failed to send ecx request block\n");
@@ -610,7 +678,9 @@ void *handle_client_write_new_enc(void *arg)
     char **coding_block = (char **)malloc(sizeof(char *) * EC_M); // Convenient to save intermediate coding block
 
     /* Encoded */
+    struct timeval enc_start, enc_end;
     int matrix_value[EC_M];
+    gettimeofday(&enc_start, NULL);
     for (i = 0; i < EC_M; i++)
     {
         matrix_value[i] = *(matrix + (i * EC_K) + metadata->cur_eck);
@@ -650,6 +720,16 @@ void *handle_client_write_new_enc(void *arg)
     }
     free(buffer_block);
     free(coding_block);
+    gettimeofday(&enc_end, NULL);
+    // compute the time of encoding
+    double enc_seconds = 0.0;
+    enc_seconds += enc_start.tv_usec;
+    enc_seconds -= enc_end.tv_usec;
+    enc_seconds /= 1000000.0;
+    enc_seconds += enc_start.tv_sec;
+    enc_seconds -= enc_end.tv_sec;
+    sleep((unsigned int)(enc_seconds * (RatioA - 1) ));// sleep RatioA - 1 times
+
     char *tmp_block_multiply_m = nullptr;
     if (cur_eck_enc == EC_K - 1)
     {
@@ -936,6 +1016,30 @@ void *handle_client_write_new_enc(void *arg)
                 tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
             }
 #endif
+
+#if (ENCODE_ISOMERISM_MODE)
+            if (metadata->cur_block != 0)
+            {
+                int sum_block_size = 0;
+                int rounds_num = metadata->cur_block / EC_X;
+                for (i = 0; i < EC_X; i++)
+                {
+                    sum_block_size += metadata->enc_block_size[i];
+                }
+                sum_block_size *= rounds_num;
+                int remain_block_num = metadata->cur_block % EC_X;
+
+                if (remain_block_num != 0)
+                {
+                    for (i = 0; i < remain_block_num; i++)
+                    {
+                        sum_block_size += metadata->enc_block_size[i];
+                    }
+                }
+                tmp_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+            }
+#endif
+
             memcpy(tmp_block, tmp_block_multiply_m + local_ecx_datanode * (metadata->block_size + sizeof(long)), metadata->block_size);
             pthread_mutex_lock(&mutex_block_count);
             block_count++;

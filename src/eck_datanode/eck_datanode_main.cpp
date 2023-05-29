@@ -273,6 +273,31 @@ void *handle_client_write_new_ecx(void *arg)
         buffer_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
     }
 #endif
+
+#if (ENCODE_ISOMERISM_MODE)
+    int i;
+    if (metadata->cur_block != 0)
+    {
+        int sum_block_size = 0;
+        int rounds_num = metadata->cur_block / EC_X;
+        for (i = 0; i < EC_X; i++)
+        {
+            sum_block_size += metadata->enc_block_size[i];
+        }
+        sum_block_size *= rounds_num;
+        int remain_block_num = metadata->cur_block % EC_X;
+
+        if (remain_block_num != 0)
+        {
+            for (i = 0; i < remain_block_num; i++)
+            {
+                sum_block_size += metadata->enc_block_size[i];
+            }
+        }
+        buffer_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+    }
+#endif
+
     metadata->data = buffer_block;
     if (send(metadata->sockfd, metadata->data, metadata->block_size, 0) < 0)
     {
@@ -394,6 +419,29 @@ void *handle_client_write_new(void *arg)
                     for (i = 0; i < remain_block_num; i++)
                     {
                         sum_block_size += metadata->net_block_size[i];
+                    }
+                }
+                buffer_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
+            }
+#endif
+
+#if (ENCODE_ISOMERISM_MODE)
+            if (metadata->cur_block != 0)
+            {
+                int sum_block_size = 0;
+                int rounds_num = metadata->cur_block / EC_X;
+                for (i = 0; i < EC_X; i++)
+                {
+                    sum_block_size += metadata->enc_block_size[i];
+                }
+                sum_block_size *= rounds_num;
+                int remain_block_num = metadata->cur_block % EC_X;
+
+                if (remain_block_num != 0)
+                {
+                    for (i = 0; i < remain_block_num; i++)
+                    {
+                        sum_block_size += metadata->enc_block_size[i];
                     }
                 }
                 buffer_block = buffer_chunk + metadata->remain_block_size + sum_block_size;
