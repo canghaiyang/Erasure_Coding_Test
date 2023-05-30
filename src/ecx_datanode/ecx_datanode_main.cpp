@@ -652,6 +652,10 @@ void *handle_client_write_request(void *arg)
     }
 
     free(buffer_next_ecx_block);
+    if (cur_block_request >= EC_N - EC_X - 1)
+    {
+        cur_block_request = EC_N;
+    }
     pthread_mutex_unlock(&cond_request_mutex);
     pthread_mutex_unlock(&mutex_buffer_next_ecx_block);
 
@@ -733,16 +737,16 @@ void *handle_client_write_new_enc(void *arg)
     free(coding_block);
 #if (ENCODE_ISOMERISM_MODE || ENCODE_WRITE_TEST)
     gettimeofday(&enc_end, NULL); // compute the time of encoding
-    enc_seconds += enc_start.tv_usec;
-    enc_seconds -= enc_end.tv_usec;
+    enc_seconds -= enc_start.tv_usec;
+    enc_seconds += enc_end.tv_usec;
     enc_seconds /= 1000000.0;
-    enc_seconds += enc_start.tv_sec;
-    enc_seconds -= enc_end.tv_sec;
+    enc_seconds -= enc_start.tv_sec;
+    enc_seconds += enc_end.tv_sec;
 #if (ENCODE_WRITE_TEST)
     int sleep_time = (int)(enc_seconds * 1000000 * (ENCODE_DELAY_MUL - 1));
 #endif
 #if (ENCODE_ISOMERISM_MODE)
-    int sleep_time = (int)(enc_seconds * 1000000 * (eiRatio[ecm - EC_K] - 1));
+    int sleep_time = (int)(enc_seconds * 1000000 * (eiRatio_delay[ecm - EC_K] - 1));
 #endif
 
 #if (TEST_LOG)

@@ -1218,11 +1218,6 @@ static int erasure_coding_write_net_enc(int argc, char **argv)
 {
     printf("[erasure_coding_write_ecknet] Write fast for different network bandwidth running...\n");
 
-#if (!NET_BANDWIDTH_MODE)
-    printf("[erasure_coding_write_ecknet] NET_BANDWIDTH_MODE is 0\n");
-    return EC_ERROR;
-#endif
-
 #if (SEND_DATANODE)
     int i, j;       // loop control variables
     int tmp_return; // return check
@@ -1263,7 +1258,7 @@ static int erasure_coding_write_net_enc(int argc, char **argv)
         sum_bwRatio += bwRatio[i];
 #endif
 #if (ENCODE_ISOMERISM_MODE)
-        sum_bwRatio += eiRatio[i];
+        sum_bwRatio += eiRatio_block[i];
 #endif
     }
     int tmp_block_size = ((chunk_size / (EC_W / 8)) / ((EC_N / EC_X) * sum_bwRatio)) * (EC_W / 8);
@@ -1762,6 +1757,23 @@ static int erasure_coding_write(int argc, char **argv)
                 printf("[erasure_coding_write] Failed to join encode_thread thread\n");
                 return EC_ERROR;
             }
+
+#if (ENCODE_WRITE_TEST)
+            time_enc = time_enc * ENCODE_DELAY_MUL;
+#endif
+
+#if (ENCODE_ISOMERISM_MODE)
+            int max_eiRatio = 0;
+            for (i = 0; i < EC_X; i++)
+            {
+                if (max_eiRatio < eiRatio_delay[i])
+                {
+                    max_eiRatio = eiRatio_delay[i];
+                }
+            }
+            time_enc = time_enc * max_eiRatio;
+#endif
+
             totalsec_enc += time_enc;
             if (time_enc < min_enc)
             {

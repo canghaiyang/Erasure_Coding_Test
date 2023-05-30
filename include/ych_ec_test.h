@@ -55,11 +55,8 @@ typedef struct metadata_s // chunk metadata and data
     char *data;                               // chunk data or block data
     char dst_filename_datanode[MAX_PATH_LEN]; // dst filename on datanode
     int error_flag;                           // check if thread error
-#if (NET_BANDWIDTH_MODE)
+#if (NET_BANDWIDTH_MODE||ENCODE_ISOMERISM_MODE)
     int net_block_size[EC_X];
-#endif
-#if (ENCODE_ISOMERISM_MODE)
-    int enc_block_size[EC_X];
 #endif
 } metadata_t;
 
@@ -80,4 +77,5 @@ typedef struct network_s // network thread metadata
 } network_t;
 
 int bwRatio[EC_X] = {10, 5, 1};
-int eiRatio[EC_X] = {10, 5, 1}; // algorithm need to be improved
+int eiRatio_block[EC_X] = {8, 4, 1}; // algorithm need to be improved
+int eiRatio_delay[EC_X] = {10, 20, 80}; // algorithm need to be improved
