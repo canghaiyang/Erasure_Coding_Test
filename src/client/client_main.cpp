@@ -193,8 +193,8 @@ void *send_one_block_datanode(void *arg)
     return nullptr;
 }
 
-#if (NET_BANDWIDTH_MODE)
-int send_blocks_eck_datanodes_net(char **block, int chunk_size, int *block_size, int remain_block_size, char *dst_filename_stripe, int client_fd)
+#if (NET_BANDWIDTH_MODE || ENCODE_ISOMERISM_MODE)
+int send_blocks_eck_datanodes_net_enc(char **block, int chunk_size, int *block_size, int remain_block_size, char *dst_filename_stripe, int client_fd)
 {
     metadata_t metadata_array[EC_K * EC_N];
     int sockfd_array[EC_K];
@@ -327,7 +327,7 @@ int send_blocks_eck_datanodes_net(char **block, int chunk_size, int *block_size,
     }
 
     int datanode_fd; // datanode socket
-    int chunk_count = EC_M;
+    int chunk_count = EC_M + EC_K;
     struct sockaddr_in datanode_addr;
     socklen_t datanode_addr_len = sizeof(datanode_addr);
     pthread_t tid_client;
@@ -1213,8 +1213,8 @@ static void help(int argc, char **argv)
               << "\t  \n"
               << std::endl;
 }
-#if (NET_BANDWIDTH_MODE)
-static int erasure_coding_write_ecknet(int argc, char **argv)
+#if (NET_BANDWIDTH_MODE || ENCODE_ISOMERISM_MODE)
+static int erasure_coding_write_net_enc(int argc, char **argv)
 {
     printf("[erasure_coding_write_ecknet] Write fast for different network bandwidth running...\n");
 
@@ -1259,7 +1259,12 @@ static int erasure_coding_write_ecknet(int argc, char **argv)
     int block_size[EC_X];
     for (i = 0; i < EC_X; i++)
     {
+#if (NET_BANDWIDTH_MODE)
         sum_bwRatio += bwRatio[i];
+#endif
+#if (ENCODE_ISOMERISM_MODE)
+        sum_bwRatio += eiRatio[i];
+#endif
     }
     int tmp_block_size = ((chunk_size / (EC_W / 8)) / ((EC_N / EC_X) * sum_bwRatio)) * (EC_W / 8);
     int remain_block_size = ((chunk_size / (EC_W / 8)) % ((EC_N / EC_X) * sum_bwRatio)) * (EC_W / 8);
@@ -1371,7 +1376,7 @@ static int erasure_coding_write_ecknet(int argc, char **argv)
         for (test_times = 1; test_times <= test_n; test_times++)
         {
             /* Send blocks to each datanode */
-            tmp_return = send_blocks_eck_datanodes_net(block, chunk_size, block_size, remain_block_size, dst_filename_stripe, client_fd);
+            tmp_return = send_blocks_eck_datanodes_net_enc(block, chunk_size, block_size, remain_block_size, dst_filename_stripe, client_fd);
             if (tmp_return == EC_ERROR)
             {
                 printf("[erasure_coding_write_ecknet] Failed to send chunks to datanode: current_reading = %d\n", current_reading);
@@ -1802,7 +1807,8 @@ static int erasure_coding_write(int argc, char **argv)
 
             FILE *file_test_fp;
             double max_tsec = 0.0;
-            for (i = 0; i < EC_K + EC_M; i++)
+            // for (i = 0; i < EC_K + EC_M; i++)
+            for (i = 0; i < 1; i++)
             {
                 gettimeofday(&t_io1, &tz);
 
@@ -2220,16 +2226,17 @@ int main(int argc, char *argv[])
         }
     }
 
-#if (NET_BANDWIDTH_MODE)
+#if (NET_BANDWIDTH_MODE || ENCODE_ISOMERISM_MODE)
     /* Cmd -kwnet: erasure coding write with new method for different network bandwidth */
-    else if (0 == strncmp(cmd, "-netkw", strlen("-kw")))
+    else if (0 == strncmp(cmd, "-netkw", strlen("-netkw")) || 0 == strncmp(cmd, "-enckw", strlen("-enckw")))
     {
-        if (erasure_coding_write_ecknet(argc, argv) == EC_ERROR)
+        if (erasure_coding_write_net_enc(argc, argv) == EC_ERROR)
         {
             printf("[main] Failed to write fast\n");
         }
     }
 #endif
+
     /* Cmd -r: erasure coding read*/
     else if (0 == strncmp(cmd, "-r", strlen("-r")))
     {

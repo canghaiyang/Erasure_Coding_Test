@@ -1,4 +1,4 @@
-#define TEST_N 10        // test times
+#define TEST_N 3         // test times
 #define ENC_THREAD_NUM 1 // encoding thread num
 #define TEST_LOG 0
 
@@ -9,15 +9,21 @@
 #define EC_X 3       // x number of encoded nodes
 #define EC_N 3       // a chunk is divided into N blocks, larger than or equal to EC_X
 
-#define NET_BANDWIDTH_MODE 0 // 1, for differnet network bandwith; 0, just regular
-#define DISK_WRITE_TEST 1    // 1, Open disk write delay: Delay multiple is DISK_DELAY_MUL ; 0, just regular
+/* Only one flag is 1 */
+#define NET_BANDWIDTH_MODE 0    // 1, for differnet network bandwith; 0, just regular
+#define ENCODE_ISOMERISM_MODE 1 // 1, for encoding isomerism; 0, for regular
+#define ENCODE_WRITE_TEST 0     // 1, Open encoding delay: Delay multiple is ENCODE_DELAY_MUL ; 0, just regular
+#define DISK_WRITE_TEST 0       // 1, Open disk write delay: Delay multiple is DISK_DELAY_MUL ; 0, just regular
 
-#define SEND_DATANODE 1      // 1, send chunks to datanode; 0, just locally encode
-#define SEND_METHOD 1        // 1, send in serial; 0,send in parallel
-#define RECV_METHOD 1        // 1, recv in serial; 0,recv in parallel
+#define SEND_DATANODE 1 // 1, send chunks to datanode; 0, just locally encode
+#define SEND_METHOD 1   // 1, send in serial; 0,send in parallel
+#define RECV_METHOD 1   // 1, recv in serial; 0,recv in parallel
 
 #if (DISK_WRITE_TEST)
 #define DISK_DELAY_MUL 10
+#endif
+#if (ENCODE_WRITE_TEST)
+#define ENCODE_DELAY_MUL 10 // Uneauql division ratio
 #endif
 
 #define WRITE_PATH "test_file/write/"                   // src_file and dst_file saved path
@@ -52,6 +58,9 @@ typedef struct metadata_s // chunk metadata and data
 #if (NET_BANDWIDTH_MODE)
     int net_block_size[EC_X];
 #endif
+#if (ENCODE_ISOMERISM_MODE)
+    int enc_block_size[EC_X];
+#endif
 } metadata_t;
 
 typedef struct encode_s // encode thread metadata
@@ -71,3 +80,4 @@ typedef struct network_s // network thread metadata
 } network_t;
 
 int bwRatio[EC_X] = {10, 5, 1};
+int eiRatio[EC_X] = {10, 5, 1}; // algorithm need to be improved

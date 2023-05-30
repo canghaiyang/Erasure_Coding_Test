@@ -169,6 +169,7 @@ void *handle_block_file_io(void *arg)
         }
     }
 
+    pthread_mutex_lock(&io_mutex);
 #if (DISK_WRITE_TEST)
     struct timeval t_io1, t_io2;
     struct timezone tz;
@@ -176,7 +177,6 @@ void *handle_block_file_io(void *arg)
     gettimeofday(&t_io1, &tz);
 #endif
 
-    pthread_mutex_lock(&io_mutex);
     fseek(chunk_fp, offset * sizeof(char), SEEK_SET);
     if (fwrite(metadata->data, sizeof(char), (size_t)metadata->block_size, chunk_fp) != (size_t)metadata->block_size)
     {
@@ -186,7 +186,6 @@ void *handle_block_file_io(void *arg)
     fflush(chunk_fp);
     fsync(fileno(chunk_fp));
     fclose(chunk_fp);
-    pthread_mutex_unlock(&io_mutex);
 
 #if (DISK_WRITE_TEST)
     gettimeofday(&t_io2, &tz);
@@ -202,6 +201,7 @@ void *handle_block_file_io(void *arg)
 #endif
     usleep(sleep_time);
 #endif
+    pthread_mutex_unlock(&io_mutex);
 
     pthread_mutex_lock(&mutex_block_count);
     block_count++;
@@ -309,7 +309,7 @@ void *send_one_request_datanode(void *arg)
         save_block_size = metadata->block_size;
     }
 
-#if (NET_BANDWIDTH_MODE)
+#if (NET_BANDWIDTH_MODE || ENCODE_ISOMERISM_MODE)
     if (metadata->cur_block - 1 != 0)
     {
         int i;
@@ -513,7 +513,7 @@ void *handle_client_write_ecx(void *arg)
         save_offset = metadata->remain_block_size + metadata->cur_block * metadata->block_size;
     }
 
-#if (NET_BANDWIDTH_MODE)
+#if (NET_BANDWIDTH_MODE || ENCODE_ISOMERISM_MODE)
     if (metadata->cur_block != 0)
     {
         int sum_block_size = 0;
@@ -623,7 +623,7 @@ void *handle_client_write_request(void *arg)
         tmp_block_size = metadata->block_size;
     }
 
-#if (NET_BANDWIDTH_MODE)
+#if (NET_BANDWIDTH_MODE || ENCODE_ISOMERISM_MODE)
     if (metadata->cur_block - 1 == 0)
     {
         tmp_block_size = metadata->net_block_size[0] + metadata->remain_block_size;
@@ -687,6 +687,11 @@ void *handle_client_write_new_enc(void *arg)
 
     /* Encoded */
     int matrix_value[EC_M];
+#if (ENCODE_ISOMERISM_MODE || ENCODE_WRITE_TEST)
+    struct timeval enc_start, enc_end;
+    double enc_seconds = 0.0;
+    gettimeofday(&enc_start, NULL);
+#endif
     for (i = 0; i < EC_M; i++)
     {
         matrix_value[i] = *(matrix + (i * EC_K) + metadata->cur_eck);
@@ -726,6 +731,25 @@ void *handle_client_write_new_enc(void *arg)
     }
     free(buffer_block);
     free(coding_block);
+#if (ENCODE_ISOMERISM_MODE || ENCODE_WRITE_TEST)
+    gettimeofday(&enc_end, NULL); // compute the time of encoding
+    enc_seconds += enc_start.tv_usec;
+    enc_seconds -= enc_end.tv_usec;
+    enc_seconds /= 1000000.0;
+    enc_seconds += enc_start.tv_sec;
+    enc_seconds -= enc_end.tv_sec;
+#if (ENCODE_WRITE_TEST)
+    int sleep_time = (int)(enc_seconds * 1000000 * (ENCODE_DELAY_MUL - 1));
+#endif
+#if (ENCODE_ISOMERISM_MODE)
+    int sleep_time = (int)(enc_seconds * 1000000 * (eiRatio[ecm - EC_K] - 1));
+#endif
+
+#if (TEST_LOG)
+    printf("block enc time = %0.10f, sleep_time = %d\n", enc_seconds, sleep_time);
+#endif
+    usleep(sleep_time);
+#endif
     char *tmp_block_multiply_m = nullptr;
     if (cur_eck_enc == EC_K - 1)
     {
@@ -772,7 +796,7 @@ void *handle_client_write_new_enc(void *arg)
                 save_offset = metadata->remain_block_size + metadata->cur_block * metadata->block_size;
             }
 
-#if (NET_BANDWIDTH_MODE)
+#if (NET_BANDWIDTH_MODE || ENCODE_ISOMERISM_MODE)
             if (metadata->cur_block != 0)
             {
                 int sum_block_size = 0;

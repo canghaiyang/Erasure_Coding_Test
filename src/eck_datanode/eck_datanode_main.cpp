@@ -204,6 +204,7 @@ void *handle_block_file_io(void *arg)
         }
     }
 
+    pthread_mutex_lock(&io_mutex);
 #if (DISK_WRITE_TEST)
     struct timeval t_io1, t_io2;
     struct timezone tz;
@@ -211,7 +212,6 @@ void *handle_block_file_io(void *arg)
     gettimeofday(&t_io1, &tz);
 #endif
 
-    pthread_mutex_lock(&io_mutex);
     fseek(chunk_fp, offset * sizeof(char), SEEK_SET);
     if (fwrite(metadata->data, sizeof(char), (size_t)metadata->block_size, chunk_fp) != (size_t)metadata->block_size)
     {
@@ -221,7 +221,6 @@ void *handle_block_file_io(void *arg)
     fflush(chunk_fp);
     fsync(fileno(chunk_fp));
     fclose(chunk_fp);
-    pthread_mutex_unlock(&io_mutex);
 
 #if (DISK_WRITE_TEST)
     gettimeofday(&t_io2, &tz);
@@ -237,6 +236,7 @@ void *handle_block_file_io(void *arg)
 #endif
     usleep(sleep_time);
 #endif
+    pthread_mutex_unlock(&io_mutex);
 
     pthread_mutex_lock(&mutex_block_count);
     block_count++;
@@ -448,7 +448,7 @@ void *handle_client_write_new(void *arg)
             {
                 save_offset = metadata->remain_block_size + metadata->cur_block * metadata->block_size;
             }
-#if (NET_BANDWIDTH_MODE)
+#if (NET_BANDWIDTH_MODE || ENCODE_ISOMERISM_MODE)
             if (metadata->cur_block != 0)
             {
                 int sum_block_size = 0;
